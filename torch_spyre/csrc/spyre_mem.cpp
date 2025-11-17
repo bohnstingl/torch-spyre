@@ -334,7 +334,7 @@ auto CreateDMAGraph(const at::Tensor& self, const at::Tensor& dst,
       sendnn::Segment::INVALID,
       sendnn::Segment::INVALID,
       sendnn::Segment::INVALID,
-      sendnn::Segment::PROGRAM(1024),
+      sendnn::Segment::PROGRAM(128),
   };
   // STAGE 2: SenSuperNodeV2 graph
   sendnn::Graph g;
