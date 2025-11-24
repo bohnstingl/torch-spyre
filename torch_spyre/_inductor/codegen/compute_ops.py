@@ -63,6 +63,8 @@ def generate_sfp_op(pointers, *, op, dimensions, inputs, outputs, reduction, **k
     # implement core division for non-broadcasting 1-d pointwise ops with large enough inputs
     cores = int(os.getenv("SENCORES", "1"))
     cores = min(cores, dimensions[-1] // 64)
+    if cores == 0:
+        raise Unsupported("WARNING: small tensors not yet supported")
     # include corelet division with core division example 
     # TO DO: when fully supported the SENCORELETS default should be 2
     corelets = int(os.getenv("SENCORELETS", "1"))
