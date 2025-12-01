@@ -18,6 +18,7 @@
 
 #include <pybind11/pybind11.h>
 
+#include <dee_internal/dee_graph_converter.hpp>
 #include <flex/flex_factory.hpp>
 #include <memory>
 #include <sendnn/graph.hpp>
@@ -168,6 +169,24 @@ void launchKernel(std::string g2_path, std::vector<at::Tensor> args) {
 
   return;
 }
+void convertArtifacts(std::string artifacts_path) {
+  dee::PBD pbd;
+  sendnn::Graph g2;
+
+  setenv("DEEPRT_EXPORT_DIR", artifacts_path.c_str(), 1);
+  senbfcc::GlobalTracedSettings::Get().UpdateValue("DEEPRT_EXPORT_DIR",
+                                                   artifacts_path);
+
+  setenv("SENDNN_SERIALIZER_FORMAT", "CBOR", 1);
+
+  // Convert compiled artifacts to sendnn g2 graph
+  pbd.FromGraph(&g2);
+
+  // Serialize g2 graph
+  sendnn::Serialize(g2, artifacts_path + "/g2");
+
+  return;
+}
 
 }  // namespace spyre
 
@@ -176,7 +195,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("start_runtime", &spyre::startRuntime);
   m.def("free_runtime", &spyre::freeRuntime);
   m.def("launch_kernel", &spyre::launchKernel);
-
+  m.def("convert_artifacts", &spyre::convertArtifacts);
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(dci_cls, "StickFormat")
