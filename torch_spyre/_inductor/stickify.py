@@ -119,16 +119,19 @@ def spyre_matmul_result_shape(
 
 def spyre_bmm_result_shape(
     x: torch.Tensor, y: torch.Tensor
-) -> Tuple[Sequence[int], SpyreDCI]:
-    x_dci: SpyreDCI = x.get_dci()
-    y_dci: SpyreDCI = y.get_dci()
-    if x_dci.format != StickFormat.DENSE or y_dci.format != StickFormat.DENSE:
-        raise Unsupported(f"bmm on sparse tensors {x_dci} {y_dci}")
-    if x_dci.dim_order != y_dci.dim_order:
-        raise Unsupported(f"bmm stick dimensions mismatch {x_dci} {y_dci}")
-    res_dci = SpyreDCI(list(x_dci.dim_order))
+) -> Tuple[Sequence[int], SpyreTensorLayout]:
+    x_layout: SpyreTensorLayout = x.get_spyre_layout()
+    y_layout: SpyreTensorLayout = y.get_spyre_layout()
+    if (
+        x_layout.format != SpyreTensorLayout.StickFormat.Dense
+        or y_layout.format != SpyreTensorLayout.StickFormat.Dense
+    ):
+        raise Unsupported(f"bmm on non-dense tensors {x_layout} {y_layout}")
+    if x_layout.host_dim_order() != y_layout.host_dim_order():
+        raise Unsupported(f"bmm stick dimensions mismatch {x_layout} {y_layout}")
     res_size = [x.size()[0], x.size()[1], y.size()[-1]]
-    return res_size, res_dci
+    res_layout = SpyreTensorLayout(res_size, x.dtype, x_layout.host_dim_order())
+    return res_size, res_layout
 
 
 def spyre_reduction_result_shape(
