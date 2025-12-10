@@ -221,6 +221,8 @@ PYBIND11_MODULE(_C, m) {
   m.def("encode_constant", &spyre::encodeConstant);
   m.def("get_sen_data_format", &spyre::getSenDataFormat);
   m.def("convert_artifacts", &spyre::convertArtifacts);
+  m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
+
   py::class_<spyre::SpyreTensorLayout> dci_cls(m, "SpyreTensorLayout");
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
@@ -229,23 +231,26 @@ PYBIND11_MODULE(_C, m) {
       .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
 
   dci_cls.def_readwrite("device_size", &spyre::SpyreTensorLayout::device_size)
-      .def_readwrite("device_strides",
-                     &spyre::SpyreTensorLayout::device_strides)
       .def_readwrite("dim_map", &spyre::SpyreTensorLayout::dim_map)
       .def_readwrite("num_stick_dims",
                      &spyre::SpyreTensorLayout::num_stick_dims)
       .def_readwrite("format", &spyre::SpyreTensorLayout::format)
       .def("__str__",
            [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("__repr__",
+           [](const spyre::SpyreTensorLayout &c) { return c.toString(); })
+      .def("device_strides", &spyre::SpyreTensorLayout::device_strides)
       .def(py::self == py::self)
-      .def(py::init<std::vector<int64_t>, c10::ScalarType>())
+      .def(py::init<std::vector<int64_t>, c10::ScalarType>(),
+           py::arg("host_size"), py::arg("dtype"))
       .def(py::init<std::vector<int64_t>, c10::ScalarType, std::vector<int32_t>,
                     spyre::SpyreTensorLayout::StickFormat>(),
            py::arg("host_size"), py::arg("dtype"), py::arg("dim_order"),
            py::arg("format") = spyre::SpyreTensorLayout::StickFormat::Dense)
-      .def(py::init<std::vector<int64_t>, std::vector<int64_t>,
-                    std::vector<int32_t>, int32_t,
-                    spyre::SpyreTensorLayout::StickFormat>());
+      .def(py::init<std::vector<int64_t>, std::vector<int32_t>, int32_t,
+                    spyre::SpyreTensorLayout::StickFormat>(),
+           py::arg("device_size"), py::arg("dim_map"),
+           py::arg("num_stick_dims"), py::arg("format"));
 
   m.def("get_spyre_tensor_layout", &spyre::get_spyre_tensor_layout);
 }
