@@ -114,7 +114,7 @@ class TestBuildingBlocks(unittest.TestCase):
             up_proj_weight,
             down_proj_weight,
         )
-        
+
     def test_rms_norm(self):
         F16_EPS = 1e-6
         T = 128
@@ -122,7 +122,7 @@ class TestBuildingBlocks(unittest.TestCase):
 
         activation = torch.randn(D, T, dtype=torch.float16)
         weight = torch.randn(D, dtype=torch.float16)
-    
+
         args = [
             activation,  # [D, T]
             weight.reshape(D, 1)
@@ -131,7 +131,7 @@ class TestBuildingBlocks(unittest.TestCase):
             torch.full([T], F16_EPS, dtype=torch.float16),  # [T,] # broadcasted scalar
             torch.full([T], D, dtype=torch.float16),  # [T,] # broadcasted scalar
         ]
-    
+
         # NOTE: To work around reduction dimension restriction,
         #       this version performs rms_norm along dim 0
         #       The inputs and the output should be transposed on the host
@@ -143,19 +143,19 @@ class TestBuildingBlocks(unittest.TestCase):
                 * torch.rsqrt(x_mean_sq + eps)[None, :]  # [D, T]
                 * weight
             )  # [D, T]
-        
+
         # Compare with pytorch native implementation
-        pytorch_fn = lambda x, w, eps, d: F.rms_norm(
-            x.mT,
-            normalized_shape=[
-                D,
-            ],
-            weight=weight,
-            eps=F16_EPS,
-        ).mT    
+        def pytorch_fn(x, w, eps, d):
+            return F.rms_norm(
+                x.mT,
+                normalized_shape=[
+                    D,
+                ],
+                weight=weight,
+                eps=F16_EPS,
+            ).mT
+
         compare_with_pytorch(rms_norm, pytorch_fn, *args)
 
         # Compare with cpu implementation
-        compare_with_cpu(
-            rms_norm, *args
-        )
+        compare_with_cpu(rms_norm, *args)

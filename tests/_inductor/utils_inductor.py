@@ -196,7 +196,8 @@ def compare_with_cpu(fn, *args, atol=0.1, rtol=0.1):
         rtol=rtol,
         msg=lambda msg: f"cpu mismatch\n\n{msg}\n",
     )
-    
+
+
 # compare with cpu
 def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1):
     torch._dynamo.reset_code_caches()  # kernel caching workaround
@@ -211,6 +212,7 @@ def compare_with_pytorch(fn, fn_pytorch, *args, atol=0.1, rtol=0.1):
         rtol=rtol,
         msg=lambda msg: f"pytorch mismatch\n\n{msg}\n",
     )
+
 
 # compare with sendnn
 def compare_with_sendnn(fn, *args, atol=0.0, rtol=0.0):
