@@ -27,6 +27,7 @@ POINTWISE_UNARY_OPS_DICT = {
     "abs": torch.abs,
     "cos": torch.cos,
     "exp": torch.exp,
+    "neg": torch.neg,
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sin": torch.sin,
@@ -428,6 +429,8 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             torch.sin,  # CPU fallback
         }
         if op in cpu_ops:
+            compare_with_cpu(op, x)
+        elif op == torch.neg:
             compare_with_cpu(op, x)
         else:
             compare(op, x)
