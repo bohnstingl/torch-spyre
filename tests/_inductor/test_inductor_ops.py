@@ -411,6 +411,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 ),
             },
         },
+        (
+            "test_numel",
+            "test_numel_cpu",
+        ): {
+            "param_sets": {
+                "size_1": {
+                    cached_randn(
+                        (
+                            64,
+                            128,
+                        )
+                    ),
+                },
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -527,6 +542,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
     def test_new_ones_cpu(self, x, y):
         compare_with_cpu(lambda x: x.new_ones((x.size())), x)
+
+    def test_numel_cpu(self, x):
+        compare_with_cpu(lambda x: torch.numel(x), x)
 
 
 if __name__ == "__main__":
