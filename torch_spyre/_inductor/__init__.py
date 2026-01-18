@@ -30,8 +30,12 @@ def _autoload():
     from torch._inductor.codegen.common import (
         register_backend_for_device,
         register_device_op_overrides,
+        get_device_op_overrides
     )
     from torch_spyre.utils.device_op_overrides import SpyreDeviceOpOverrides
+
+    # Ensure that standard devices from PyTorch are also registered
+    get_device_op_overrides('cpu')
 
     register_device_op_overrides(
         device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()

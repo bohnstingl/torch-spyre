@@ -15,6 +15,7 @@
 from typing import Optional, Any, Callable, List
 
 import torch
+from torch._inductor.virtualized import V
 from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
@@ -22,6 +23,7 @@ from torch._inductor.custom_graph_pass import (
 from torch._inductor.scheduler import BaseSchedulerNode
 from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
+from .constants import DEVICE_NAME
 
 
 class CustomPrePasses(CustomGraphPass):
@@ -72,6 +74,7 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
-    nodes = propagate_spyre_tensor_layouts(nodes)
-    nodes = core_division_planning(nodes)
+    if len(V.graph.graph_input_names) > 0 and any(inp_device.type == DEVICE_NAME for inp_device in V.graph.device_node_mapping.keys()):
+        nodes = propagate_spyre_tensor_layouts(nodes)
+        nodes = core_division_planning(nodes)
     return nodes
