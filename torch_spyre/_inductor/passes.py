@@ -15,7 +15,6 @@
 from typing import Optional, Any, Callable, List
 
 import torch
-from torch._inductor.virtualized import V
 from torch._inductor.custom_graph_pass import (
     CustomGraphPass,
     get_hash_for_files,
@@ -65,14 +64,18 @@ class CustomPostPasses(CustomGraphPass):
         files = [c.file() for c in CustomPostPasses.passes]
         return get_hash_for_files(tuple(set(files + [__file__])))
 
+
 def _maybe_run_pass(pass_fn, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     has_spyre_device = any(
         node.get_device() is not None and node.get_device().type == DEVICE_NAME
         for node in nodes
     )
-    
+
     if has_spyre_device:
         return pass_fn(nodes)
+
+    return nodes
+
 
 def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
