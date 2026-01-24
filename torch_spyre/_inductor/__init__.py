@@ -32,10 +32,12 @@ def _autoload():
         register_device_op_overrides,
         get_device_op_overrides
     )
+    
+    # Register in-tree CPU and CUDA device
+    from torch._inductor.codegen import cpu_device_op_overrides
+    from torch._inductor.codegen.cuda import device_op_overrides
+    
     from torch_spyre.utils.device_op_overrides import SpyreDeviceOpOverrides
-
-    # Ensure that standard devices from PyTorch are also registered
-    get_device_op_overrides('cpu')
 
     register_device_op_overrides(
         device=DEVICE_NAME, device_op_overrides=SpyreDeviceOpOverrides()
@@ -74,13 +76,13 @@ def _autoload():
     torch._inductor.virtualized.V.set_choices_handler(SpyreHeuristics())
 
     # Customize inductor configuration
-    from .passes import CustomPrePasses, CustomPostPasses, scheduler_passes
+    from .passes import CustomPrePasses, CustomPostPasses, scheduler_passes, _maybe_run_pass
 
     torch._inductor.config.split_reductions = False
     torch._inductor.config.benchmark_harness = False
     torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
     torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
-    torch._inductor.config._pre_fusion_custom_pass = scheduler_passes
+    torch._inductor.config._pre_fusion_custom_pass = lambda nodes: _maybe_run_pass(scheduler_passes, nodes)
     # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
     torch._inductor.config.unroll_reductions_threshold = 1

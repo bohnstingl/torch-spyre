@@ -39,7 +39,7 @@ class CustomPrePasses(CustomGraphPass):
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPrePasses.passes:
-            p(graph)
+            _maybe_run_pass(p, graph)
 
     def uuid(self) -> Optional[Any]:
         files = [c.file() for c in CustomPrePasses.passes]
@@ -59,12 +59,20 @@ class CustomPostPasses(CustomGraphPass):
 
     def __call__(self, graph: torch.fx.graph.Graph) -> None:
         for p in CustomPostPasses.passes:
-            p(graph)
+            _maybe_run_pass(p, graph)
 
     def uuid(self) -> Optional[Any]:
         files = [c.file() for c in CustomPostPasses.passes]
         return get_hash_for_files(tuple(set(files + [__file__])))
 
+def _maybe_run_pass(pass_fn, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+    has_spyre_device = any(
+        node.get_device() is not None and node.get_device().type == DEVICE_NAME
+        for node in nodes
+    )
+    
+    if has_spyre_device:
+        return pass_fn(nodes)
 
 def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     """
@@ -74,7 +82,7 @@ def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
-    if len(V.graph.graph_input_names) > 0 and any(inp_device.type == DEVICE_NAME for inp_device in V.graph.device_node_mapping.keys()):
-        nodes = propagate_spyre_tensor_layouts(nodes)
-        nodes = core_division_planning(nodes)
+
+    nodes = propagate_spyre_tensor_layouts(nodes)
+    nodes = core_division_planning(nodes)
     return nodes
