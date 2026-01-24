@@ -30,12 +30,11 @@ def _autoload():
     from torch._inductor.codegen.common import (
         register_backend_for_device,
         register_device_op_overrides,
-        get_device_op_overrides,
     )
 
     # Register in-tree CPU and CUDA device
-    from torch._inductor.codegen import cpu_device_op_overrides
-    from torch._inductor.codegen.cuda import device_op_overrides
+    from torch._inductor.codegen import cpu_device_op_overrides  # noqa: F401  # usort: skip
+    from torch._inductor.codegen.cuda import device_op_overrides  # noqa: F401  # usort: skip
 
     from torch_spyre.utils.device_op_overrides import SpyreDeviceOpOverrides
 
