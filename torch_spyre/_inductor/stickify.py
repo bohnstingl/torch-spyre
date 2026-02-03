@@ -32,6 +32,7 @@ from torch._inductor.scheduler import (
     BaseSchedulerNode,
     SchedulerNode,
     ExternKernelSchedulerNode,
+    NopKernelSchedulerNode,
 )
 from torch._inductor.utils import sympy_subs
 from torch._inductor.virtualized import V
@@ -218,7 +219,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
             output.size,
             output.dtype,
             x_stl.host_dim_order(),
-            StickFormat.SparseMulti,
+            StickFormat.Sparse,
         )
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
@@ -228,7 +229,12 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         input_dims = stride_order_vars(input.dep.index)
         stick_var = input_dims[-1]
         is_stick_reduction = stick_var not in output_dims
-        format = StickFormat.Sparse if is_stick_reduction else StickFormat.Dense
+        keep_dim = len(input.layout.size) == len(output.size)
+        format = (
+            StickFormat.Sparse
+            if is_stick_reduction and not keep_dim
+            else StickFormat.Dense
+        )
         stl = SpyreTensorLayout(
             output.size, output.dtype, list(range(len(output.size))), format
         )
@@ -237,7 +243,7 @@ def reduction_layout(n: SchedulerNode, args: list[SchedNodeArg]) -> FixedTiledLa
         )
 
 
-def fallback_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
+def generic_layout(n: ExternKernelSchedulerNode) -> FixedTiledLayout:
     output: FixedLayout = n.node.get_layout()
     # Use the generic stick format
     stl = SpyreTensorLayout(output.size, output.dtype)
@@ -301,10 +307,13 @@ def propagate_spyre_tensor_layouts(
                 ):
                     raise RuntimeError("FallbackKernel must be followed by MultiOutput")
 
-                output_layout = fallback_layout(n)
+                output_layout = generic_layout(n)
                 n.node.layout = output_layout
             else:
                 print(f"Warning: unhandled node type {type(n.node)}")
+        elif isinstance(n, NopKernelSchedulerNode):
+            output_layout = generic_layout(n)
+            n.node.layout = output_layout
         else:
             print(f"Warning: unhandled scheduler node type {type(n)}")
 

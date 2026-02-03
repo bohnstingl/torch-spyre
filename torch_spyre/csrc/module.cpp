@@ -255,6 +255,7 @@ PYBIND11_MODULE(_C, m) {
   m.def("convert_artifacts", &spyre::convertArtifacts);
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout);
   m.def("to_with_layout", &spyre::to_with_layout);
+  m.def("empty_with_layout", &spyre::empty_with_layout);
 
   py::enum_<DataFormats>(m, "DataFormats")
       .value("SEN169_FP16", DataFormats::SEN169_FP16)
@@ -283,8 +284,7 @@ PYBIND11_MODULE(_C, m) {
 
   py::enum_<spyre::SpyreTensorLayout::StickFormat>(m, "StickFormat")
       .value("Dense", spyre::SpyreTensorLayout::StickFormat::Dense)
-      .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse)
-      .value("SparseMulti", spyre::SpyreTensorLayout::StickFormat::SparseMulti);
+      .value("Sparse", spyre::SpyreTensorLayout::StickFormat::Sparse);
 
   dci_cls.def_readonly("device_size", &spyre::SpyreTensorLayout::device_size)
       .def_readonly("dim_map", &spyre::SpyreTensorLayout::dim_map)
