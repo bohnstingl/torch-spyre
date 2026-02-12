@@ -22,6 +22,8 @@ import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch.testing._internal.common_methods_invocations import op_db
 
+from _inductor.utils_inductor import compare_with_cpu
+
 
 class TestOps(TestCase):
     def __init__(self, method_name="runTest", methodName="runTest"):
@@ -447,6 +449,502 @@ class TestOps(TestCase):
         torch.testing.assert_close(
             z, torch.matmul(x, y), rtol=self.rtol, atol=self.atol
         )
+
+    def test_sdpa_comp(self):
+        # num_queries_per_kv = 4
+        num_queries_per_kv = 1
+        working_precision = torch.float16
+        scale = torch.tensor(0.08838834764831843, dtype=working_precision)
+
+        query = torch.randn([1, 16, 32, 128], dtype=working_precision)
+        # key = torch.randn([1, 131072, 8, 128], dtype=working_precision)
+        # value = torch.randn([1, 131072, 8, 128], dtype=working_precision)
+        key = torch.randn([1, 131072, 32, 128], dtype=working_precision)
+        value = torch.randn([1, 131072, 32, 128], dtype=working_precision)
+        block_mask = (
+            torch.randn([1, 32, 16, 131072], dtype=working_precision) > 0.0
+        ).to(torch.bool)
+
+        def _attn(q, k, v, b, s):
+            # Handle grouped-query attention
+            if num_queries_per_kv > 1:
+                # Repeat KV heads to match query heads
+                k = k.repeat_interleave(num_queries_per_kv, dim=2)
+                v = v.repeat_interleave(num_queries_per_kv, dim=2)
+
+            # Transpose for matmul
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+
+            # Compute Q @ K^T
+            attn_scores = torch.matmul(
+                q.to(working_precision), k.to(working_precision).transpose(-2, -1)
+            )
+
+            # Scale
+            attn_scores = (attn_scores * s).to(working_precision)
+
+            if b is not None:
+                attn_scores = attn_scores.masked_fill(b, -float("inf"))
+
+            # Softmax
+            attn_weights = torch._safe_softmax(attn_scores, dim=-1)
+
+            # Compute attention output
+            attn_output = torch.matmul(attn_weights.to(q.dtype), v.to(q.dtype))
+
+            # Transpose back
+            attn_output = attn_output.transpose(1, 2).squeeze(0)
+
+            return attn_output
+
+            return attn_scores
+
+        compare_with_cpu(_attn, *[query, key, value, block_mask, scale])
+
+    def test_sdpa_block(self):
+        working_precision = torch.float16
+        kv_cache = torch.randn([2, 8192, 16, 8, 128], dtype=working_precision)
+        block_table = torch.tensor([[4, 5, 443], [1, 3, 2]], dtype=torch.int32)
+        seq_lens = torch.tensor([32, 40], dtype=torch.int32)
+        causal_mask = torch.tensor(
+            [
+                [
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+                [
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    False,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                ],
+            ],
+            dtype=torch.bool,
+        )
+        slot_mapping = torch.tensor(
+            [88, 89, 90, 91, 92, 93, 94, 95, 32, 33, 34, 35, 36, 37, 38, 39],
+            dtype=torch.float32,
+        )
+        query_start_loc = torch.tensor([0, 8, 16], dtype=torch.float32)
+        block_size = 16
+        num_heads = 32
+
+        def _block_creation(kv, bt, sq, cm, slm, qs):
+            num_seqs = bt.shape[0]
+            num_blocks, block_size, num_kv_heads, head_size = kv.shape[1:]
+
+            num_tokens_per_sequence = [qs[i + 1] - qs[i] for i in range(len(qs) - 1)]
+            max_num_tokens_per_sequence = torch.max(
+                torch.stack(num_tokens_per_sequence)
+            )
+
+            # Initialize output tensor
+            block_mask = torch.ones(
+                num_seqs * max_num_tokens_per_sequence,
+                num_blocks * block_size,
+                dtype=torch.bool,
+                device=kv.device,
+            )
+
+            # Gather tokens for each sequence
+            for seq_idx in range(num_seqs):
+                seq_remainder = sq[seq_idx] % block_size
+                for bl_ind, bl in enumerate(bt[seq_idx]):
+                    seq_len_curr_block = min(
+                        sq[seq_idx] - bl_ind * block_size, block_size
+                    )
+                    max_bl_ind = (sq[seq_idx] // block_size) + (
+                        1 if sq[seq_idx] % block_size else 0
+                    )
+                    if bl_ind < max_bl_ind:
+                        block_mask[
+                            seq_idx * max_num_tokens_per_sequence : (seq_idx + 1)
+                            * max_num_tokens_per_sequence,
+                            bl * block_size : bl * block_size + seq_len_curr_block,
+                        ] = 0
+
+                if cm is not None:
+                    for token_nr in range(num_tokens_per_sequence[seq_idx] - 1):
+                        slot_for_write = slm[qs[seq_idx] + 1 + token_nr :]
+                        block_mask[
+                            seq_idx * max_num_tokens_per_sequence + token_nr,
+                            slot_for_write,
+                        ] = 1
+
+            block_mask = block_mask.unsqueeze(0).unsqueeze(0)
+            block_mask = block_mask.expand(-1, num_heads, -1, -1)
+
+            return block_mask
+
+        compare_with_cpu(
+            _block_creation,
+            *[
+                kv_cache,
+                block_table,
+                seq_lens,
+                causal_mask,
+                slot_mapping,
+                query_start_loc,
+            ],
+        )
+
+    def test_sdpa_KVupdate(self):
+        working_precision = torch.float16
+        key = torch.randn([2, 8, 128], dtype=working_precision)
+        value = torch.randn([2, 8, 128], dtype=working_precision)
+        kv_cache = torch.randn([2, 8192, 16, 8, 128], dtype=working_precision)
+        slot_mapping = torch.tensor([95, 39], dtype=torch.int64)
+        block_size = 16
+
+        def _block_creation(k, v, kv, slm):
+            num_tokens = k.shape[0]
+
+            # Convert slot indices to block indices and offsets
+            block_indices = slm // block_size
+            block_offsets = slm % block_size
+
+            # Get key and value caches
+            key_cache = kv[0]
+            value_cache = kv[1]
+
+            # Write keys and values using advanced indexing
+            for i in range(num_tokens):
+                block_idx = block_indices[i].item()
+                offset = block_offsets[i].item()
+                key_cache[block_idx, offset] = k[i]
+                value_cache[block_idx, offset] = v[i]
+
+            return kv, key_cache, value_cache
+
+        compare_with_cpu(_block_creation, *[key, value, kv_cache, slot_mapping])
 
     @unittest.skip("TODO: mean.out not implemented in eager mode")
     def test_mean(self):

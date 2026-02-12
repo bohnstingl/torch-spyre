@@ -189,11 +189,16 @@ def compare_with_eager(fn, *args, atol=0, rtol=0, needs_device=False):
 def compare_with_cpu(
     fn, *args, atol=0.1, rtol=0.1, needs_device=False, cpu_compile=True
 ):
-    def _run_compiled_device(device):
+    def _run(device, compile=True):
         torch._dynamo.reset_code_caches()  # kernel caching workaround
         device_args = [arg.to(device) for arg in args]
         device_kwargs = {"device": device} if needs_device else {}
-        result = torch.compile(fn)(*device_args, **device_kwargs)
+        if compile:
+            _fn = torch.compile(fn)
+        else:
+            _fn = fn
+
+        result = _fn(*device_args, **device_kwargs)
         if not isinstance(result, int):
             assert result.device.type == device.type, (
                 f"The output of the compiled function is not on the expected device. Expected {device}, Actual {result.device}"
@@ -201,8 +206,13 @@ def compare_with_cpu(
             result = result.cpu()
         return result
 
-    cpu_result = fn(*args)
-    spyre_compiled_result = _run_compiled_device(DEVICE)
+    # cpu_result = fn(*args)
+
+    # Run in compile mode
+    # spyre_compiled_result = _run(DEVICE, True)
+
+    # Run in eager mode
+    spyre_compiled_result = _run(DEVICE, False)
 
     torch.testing.assert_close(
         spyre_compiled_result,
