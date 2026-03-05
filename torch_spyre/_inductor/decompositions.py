@@ -74,9 +74,36 @@ def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
-    Register decompositions specifically for Spyre device.
-    These will only be active when compiling for the Spyre device.
+    DEPRECATED: Use register_spyre_decompositions_via_dispatchkey instead.
+    
+    This function is deprecated and will be removed in a future release.
+    With upstream PyTorch changes, backend kernels registered via DispatchKey
+    now take precedence over decompositions automatically, so only DispatchKey
+    registration is needed.
+    
+    Migration:
+        Before (dual registration):
+            @register_spyre_decomposition(torch.ops.aten.my_op.default)
+            @register_spyre_decompositions_via_dispatchkey(torch.ops.aten.my_op.default)
+            def spyre_my_op(x):
+                return x + 1
+        
+        After (single registration):
+            @register_spyre_decompositions_via_dispatchkey(torch.ops.aten.my_op.default)
+            def spyre_my_op(x):
+                return x + 1
+    
+    See DOWNSTREAM_CHANGES_PLAN.md for details.
     """
+    import warnings
+    warnings.warn(
+        "register_spyre_decomposition is deprecated. "
+        "Use register_spyre_decompositions_via_dispatchkey instead. "
+        "With upstream PyTorch changes, backend kernels now take precedence automatically. "
+        "See DOWNSTREAM_CHANGES_PLAN.md for migration details.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     return decomp.register_decomposition(ops, spyre_decompositions)
 
 
@@ -84,12 +111,36 @@ def register_spyre_decomposition(
 @contextmanager
 def enable_spyre_decompositions():
     """
-    CM that enables Spyre decompositions:
-      - Temporarily adds relevant Spyre decompositions to global decompositions dictionary
-      - Restore original decompositions on exit
-
-    This CM is reentrant and safe under nested usage.
+    DEPRECATED: No longer necessary with upstream PyTorch changes.
+    
+    This context manager is deprecated and will be removed in a future release.
+    With upstream PyTorch changes, backend kernels registered via DispatchKey
+    now take precedence over decompositions automatically, so modifying the
+    global decomposition table is no longer necessary.
+    
+    The context manager still functions for backward compatibility but will
+    emit a deprecation warning.
+    
+    Migration:
+        Before:
+            with enable_spyre_decompositions():
+                # compile code
+        
+        After:
+            # No context manager needed - backend kernels work automatically
+            # compile code
+    
+    See DOWNSTREAM_CHANGES_PLAN.md for details.
     """
+    import warnings
+    warnings.warn(
+        "enable_spyre_decompositions is deprecated and no longer necessary. "
+        "Backend kernels registered via DispatchKey now take precedence automatically. "
+        "See DOWNSTREAM_CHANGES_PLAN.md for migration details.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     global _decompositions_nesting
     with _decompositions_lock:
         first_enter = (_decompositions_nesting == 0)  # fmt: skip
