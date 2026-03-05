@@ -72,36 +72,19 @@ def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],
 ) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
-    DEPRECATED: Use register_spyre_decompositions_via_dispatchkey instead.
-    
-    This function is deprecated and will be removed in a future release.
-    With upstream PyTorch changes, backend kernels registered via DispatchKey
-    now take precedence over decompositions automatically, so only DispatchKey
-    registration is needed.
-    
-    Migration:
-        Before (dual registration):
-            @register_spyre_decomposition(torch.ops.aten.my_op.default)
-            @register_spyre_decompositions_via_dispatchkey(torch.ops.aten.my_op.default)
-            def spyre_my_op(x):
-                return x + 1
-        
-        After (single registration):
-            @register_spyre_decompositions_via_dispatchkey(torch.ops.aten.my_op.default)
-            def spyre_my_op(x):
-                return x + 1
-    
-    See DOWNSTREAM_CHANGES_PLAN.md for details.
+    Register decompositions specifically for the Spyre compile-time decomposition table.
+    These are active during torch.compile (make_fx tracing) when the Spyre decomposition
+    table is in use.
+
+    Use this decorator for ops that only need compile-time decomposition support and do
+    NOT require eager-mode dispatch through the PyTorch dispatcher.  Examples: full, gt,
+    lt, logical_not.
+
+    For ops that need BOTH compile-time decomposition AND eager-mode dispatch (e.g. gelu,
+    layer_norm, rms_norm, softplus), use @register_spyre_decompositions_via_dispatchkey
+    alone — it now registers the function in both spyre_decompositions (compile path) and
+    spyre_decompositions_via_dispatchkey (eager path).
     """
-    import warnings
-    warnings.warn(
-        "register_spyre_decomposition is deprecated. "
-        "Use register_spyre_decompositions_via_dispatchkey instead. "
-        "With upstream PyTorch changes, backend kernels now take precedence automatically. "
-        "See DOWNSTREAM_CHANGES_PLAN.md for migration details.",
-        DeprecationWarning,
-        stacklevel=2
-    )
     return decomp.register_decomposition(ops, spyre_decompositions)
 
 
@@ -278,6 +261,13 @@ def register_spyre_decompositions_via_dispatchkey(
     """
 
     def decomposition_decorator(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        # Also register the raw function in spyre_decompositions so that compile-time
+        # make_fx tracing (inside AOT Autograd) uses the Spyre implementation instead
+        # of falling through to CompositeImplicitAutograd.  This removes the need to
+        # apply @register_spyre_decomposition as a second decorator for ops that also
+        # need eager-mode dispatch via the PrivateUse1 key.
+        decomp.register_decomposition(ops, spyre_decompositions)(fn)
+
         class OPWrapper:
             def __init__(self, op, spyre_fn):
                 self.op = op
@@ -436,11 +426,10 @@ def logical_not_decomp(input: torch.Tensor) -> torch.Tensor:
 ###############################################################################################
 ##                           Functions requiring dispatch keys                               ##
 ###############################################################################################
-# Note: Both decorators are needed for such operators:
-# - @register_spyre_decomposition: Registers in decomposition table for make_fx (torch.compile)
-# - @register_spyre_decompositions_via_dispatchkey: Registers PrivateUse1 kernel for eager mode
+# @register_spyre_decompositions_via_dispatchkey is sufficient for these ops: it registers
+# both the PrivateUse1 kernel (for eager-mode dispatch) and an entry in spyre_decompositions
+# (for compile-time make_fx tracing, preventing CIA from running).
 @register_spyre_decompositions_via_dispatchkey([torch.ops.aten.rms_norm.default])
-@register_spyre_decomposition([torch.ops.aten.rms_norm.default])
 def spyre_rms_norm(
     input: torch.Tensor,
     normalized_shape: list[int],
@@ -469,7 +458,6 @@ def spyre_rms_norm(
 
 
 @register_spyre_decompositions_via_dispatchkey([torch.ops.aten.layer_norm.default])
-@register_spyre_decomposition([torch.ops.aten.layer_norm.default])
 def spyre_layer_norm(
     input: torch.Tensor,
     normalized_shape: Sequence[int],
@@ -488,7 +476,6 @@ def spyre_layer_norm(
 
 
 @register_spyre_decompositions_via_dispatchkey([torch.ops.aten.gelu.default])
-@register_spyre_decomposition([torch.ops.aten.gelu.default])
 def spyre_gelu(
     input: torch.Tensor,
     approximate: str = "none",
@@ -497,7 +484,6 @@ def spyre_gelu(
 
 
 @register_spyre_decompositions_via_dispatchkey([torch.ops.aten.softplus.default])
-@register_spyre_decomposition([torch.ops.aten.softplus.default])
 def spyre_softplus(
     input: torch.Tensor, beta: float = 1.0, threshold: float = 20.0
 ) -> torch.Tensor:
