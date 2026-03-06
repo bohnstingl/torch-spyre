@@ -53,14 +53,10 @@ def enable_spyre_context(
         example_inputs: List of example inputs to the graph being compiled. Used to
             set real inputs in the virtualized context for shape inference and
             optimization decisions.
-        decomps: Decomposition table to be populated with Spyre-specific
-            decompositions. Maps operator overloads to their decomposition implementations.
-            This is typically a clone of PyTorch Inductor's global decomposition registry.
+        decomps: Base decomposition table to build the Spyre table from. A fresh
+            per-compilation copy is created with Spyre-specific overrides applied.
+            Defaults to PyTorch Inductor's global decomposition registry.
     """
-
-    if decomps is None:
-        decomps = torch._inductor.decomposition.decompositions
-
     from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
 
     # Ensure decorators run (custom ops/decomp/lowerings modules)

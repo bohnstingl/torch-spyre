@@ -91,20 +91,16 @@ def enable_spyre_compile_fx_wrapper():
 
         @wraps(_orig)
         def _wrapper(gm, example_inputs, *args, **kwargs):
-            decomps = kwargs.setdefault(
-                "decompositions", torch._inductor.decomposition.decompositions
-            )
-
             if _uses_spyre(gm, example_inputs):
                 torch.spyre._impl._lazy_init()
+
+                # Pass any caller-supplied decompositions table as the base;
+                # enable_spyre_context will build a fresh merged copy from it.
+                decomps = kwargs.get("decompositions")
 
                 with enable_spyre_context(
                     example_inputs, decomps=decomps
                 ) as spyre_context_decompositions:
-                    # The `decomps` is the updated in the context manager
-                    # with the appropriate spyre decompositions
-                    # and yielded as `spyre_context_decompositions` from the CM
-
                     kwargs["decompositions"] = spyre_context_decompositions
 
                     return _orig(
