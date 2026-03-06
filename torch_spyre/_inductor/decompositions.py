@@ -107,7 +107,11 @@ def enable_spyre_decompositions(
     from torch._ops import OpOverload, OpOverloadPacket
     from torch_spyre.fallbacks import fallback_ops
 
-    base = decomps if decomps is not None else torch._inductor.decomposition.select_decomp_table()
+    base = (
+        decomps
+        if decomps is not None
+        else torch._inductor.decomposition.select_decomp_table()
+    )
 
     # Fresh copy per compilation — the original dict is never modified.
     merged = dict(base)
