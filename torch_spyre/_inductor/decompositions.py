@@ -24,8 +24,6 @@ from .constants import DEVICE_NAME
 from .errors import Unsupported
 from . import customops  # noqa: F401
 
-import threading
-
 # Dictionary for Spyre-specific decompositions
 spyre_decompositions: dict = {}
 
@@ -40,10 +38,6 @@ spyre_decompositions_to_exclude = [
     torch.ops.aten.new_ones,
 ]
 
-# A module-level lock + nesting counter to make the CM reentrant/thread-safe
-_decompositions_via_dispatchkey_lock = threading.RLock()
-_decompositions_via_dispatchkey_nesting = 0
-
 # Dict for Spyre-specific decompositions to be registered via DispatchKey
 spyre_decompositions_via_dispatchkey: dict = {}
 
@@ -54,12 +48,6 @@ spyre_decompositions_via_dispatchkey: dict = {}
 _spyre_autograd_lib = None
 _spyre_lib = None
 _dispatchkey_kernels_registered = False
-
-# When True, the Spyre kernels are active for eager-mode dispatch even outside
-# of a torch.compile context. Set by
-# _register_spyre_dispatchkey_kernels_permanently() and set to
-# False when context manager enable_spyre_decompositions_via_dispatchkey is left.
-_spyre_eager_mode_enabled = True
 
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
@@ -134,10 +122,58 @@ def enable_spyre_decompositions(
     yield merged
 
 
+class _SpyreGetDecompFn:
+    """
+    Stable module-level callable that returns the merged Spyre decomposition table.
+
+    Being a singleton (``_spyre_get_decomp_fn``), its object identity is constant
+    across compilations.  This means ``functools.cache`` in upstream ``lazy_init``
+    and ``_sfdp_init`` creates exactly **one** cache entry for all Spyre
+    compilations, rather than a new entry per compilation (which would happen with
+    an inline lambda that captures a fresh dict each time).
+
+    The merged table is computed lazily on first call and then reused.  It is safe
+    to cache because all inputs — the global Inductor decompositions table,
+    ``spyre_decompositions``, ``fallback_ops``, and
+    ``spyre_decompositions_to_exclude`` — are fixed after module load.
+
+    Note: ``decompositions`` passed to ``compile_fx`` for AOT Autograd tracing is
+    still the per-compilation fresh copy produced by ``enable_spyre_decompositions``.
+    This singleton is only used for joint-graph pattern matching (SFDP etc.).
+    """
+
+    _decomps: Optional[dict] = None
+
+    def __call__(self) -> dict:
+        if self._decomps is None:
+            from torch._ops import OpOverload, OpOverloadPacket
+            from torch_spyre.fallbacks import fallback_ops
+
+            base = torch._inductor.decomposition.select_decomp_table()
+            merged = dict(base)
+            merged.update(spyre_decompositions)
+
+            def _remove_ops(ops_to_remove):
+                for op in ops_to_remove:
+                    if isinstance(op, OpOverloadPacket):
+                        for overload_name in op.overloads():
+                            merged.pop(getattr(op, overload_name), None)
+                    elif isinstance(op, OpOverload):
+                        merged.pop(op, None)
+
+            _remove_ops(spyre_decompositions_to_exclude)
+            _remove_ops(fallback_ops)
+            self._decomps = merged
+        return self._decomps
+
+
+_spyre_get_decomp_fn = _SpyreGetDecompFn()
+
+
 def _register_spyre_dispatchkey_kernels_permanently():
     """
     Permanently register PrivateUse1 / AutogradPrivateUse1 kernels for all ops
-    in ``spyre_decompositions_via_dispatchkey`` and activate them for eager mode.
+    in ``spyre_decompositions_via_dispatchkey``.
 
     This must be called once before any eager-mode dispatch can reach the Spyre
     kernels (typically from ``_SpyreImpl._lazy_init()``).  It is idempotent:
@@ -146,14 +182,11 @@ def _register_spyre_dispatchkey_kernels_permanently():
     The ``Library`` objects are stored in module-level globals so they are never
     garbage-collected (and therefore never unregistered from the C++ dispatcher).
 
-    After this call ``_spyre_eager_mode_enabled`` is set to ``True``.  The
-    ``OPWrapper.__call__`` method checks this flag in addition to
-    ``spyre_enabled`` so that eager-mode dispatch always reaches the Spyre
-    implementation, while ``torch.compile``'s ``make_fx`` shape-inference passes
-    (which run with ``spyre_enabled = False``) still fall through correctly.
+    After registration ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
+    to route dispatch: inside a ``torch.compile`` context the Spyre function is called
+    directly; outside (eager mode) the pre-compiled wrapper is used.
     """
     global _spyre_autograd_lib, _spyre_lib, _dispatchkey_kernels_registered
-    global _spyre_eager_mode_enabled
 
     if _dispatchkey_kernels_registered:
         return
@@ -166,13 +199,8 @@ def _register_spyre_dispatchkey_kernels_permanently():
     for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
         # Autograd key: fall through so that the PrivateUse1 kernel is reached.
         _spyre_autograd_lib.impl(op._name, fallthrough_kernel)
-        # PrivateUse1 key: the OPWrapper dispatches to spyre_fn when enabled.
+        # PrivateUse1 key: the OPWrapper dispatches to spyre_fn.
         _spyre_lib.impl(op._name, wrapper_cls)
-
-    # Mark eager mode as active. OPWrapper.__call__ checks this flag so that
-    # Spyre kernels are used for all eager-mode dispatch, independently of the
-    # compile-time spyre_enabled toggle.
-    _spyre_eager_mode_enabled = True
 
     _dispatchkey_kernels_registered = True
 
@@ -198,33 +226,13 @@ def register_spyre_decompositions_via_dispatchkey(
             def __init__(self, op, spyre_fn):
                 self.op = op
                 self.spyre_fn = spyre_fn
-                # Default to False: the kernel is registered permanently in the
-                # dispatcher, but the Spyre implementation is only activated
-                # when enable_spyre_decompositions_via_dispatchkey() is active
-                # (torch.compile path) or when eager mode is explicitly enabled
-                # via _register_spyre_dispatchkey_kernels_permanently().
-                self._spyre_enabled = False
-
-            @property
-            def spyre_enabled(self):
-                return self._spyre_enabled
-
-            @spyre_enabled.setter
-            def spyre_enabled(self, value):
-                self._spyre_enabled = bool(value)
+                # Pre-compile once so that repeated eager-mode calls reuse the
+                # same compiled entry point rather than constructing a new
+                # torch.compile wrapper on every invocation.
+                self._compiled_fn = torch.compile(spyre_fn)
 
             def __call__(self, *args, **kwargs):
-                if not self.spyre_enabled and not _spyre_eager_mode_enabled:
-                    # spyre_enabled is False (we are outside a torch.compile
-                    # context or inside make_fx shape-inference) AND eager mode
-                    # has not been activated.  Fall through to the next dispatch
-                    # key so that the default PyTorch implementation is used.
-                    with torch._C._ExcludeDispatchKeyGuard(
-                        torch._C.DispatchKeySet(torch._C.DispatchKey.PrivateUse1)
-                    ):
-                        return self.op(*args, **kwargs)
-
-                # We are about to execute the op on spyre, hence the inputs are expected to be on spyre
+                # We are about to execute the op on spyre; inputs must be on spyre.
                 if any(
                     isinstance(x, torch.Tensor)
                     and getattr(x.device, "type", None) != DEVICE_NAME
@@ -234,13 +242,14 @@ def register_spyre_decompositions_via_dispatchkey(
                         "Spyre decomposition function called with inputs being on a different device!"
                     )
 
-                # Check if we're already inside a torch.compile context
+                # Inside a torch.compile context (make_fx tracing, Inductor
+                # lowering, etc.) call the function directly — wrapping it in
+                # another torch.compile call would be incorrect.
                 if torch.compiler.is_compiling():
-                    # Already compiling, call the function directly
                     return self.spyre_fn(*args, **kwargs)
                 else:
-                    # Not compiling, wrap with torch.compile
-                    return torch.compile(self.spyre_fn)(*args, **kwargs)
+                    # Eager mode: use the pre-compiled wrapper.
+                    return self._compiled_fn(*args, **kwargs)
 
         def register(op):
             spyre_decompositions_via_dispatchkey[op] = OPWrapper(op, fn)
@@ -255,40 +264,19 @@ def register_spyre_decompositions_via_dispatchkey(
 @contextmanager
 def enable_spyre_decompositions_via_dispatchkey():
     """
-    Context manager that activates the Spyre PrivateUse1 kernels for the
-    duration of a ``torch.compile`` call.
+    Context manager that ensures the Spyre PrivateUse1 kernels are registered
+    for the duration of a ``torch.compile`` call.
 
-    The kernels themselves are registered permanently in the C++ dispatcher by
-    ``_register_spyre_dispatchkey_kernels_permanently()`` (called on first
-    entry).  This CM only toggles the ``OPWrapper.spyre_enabled`` flag so that
-    the Spyre implementation is used inside the context and the fallthrough path
-    is used outside of it (e.g. during ``make_fx`` shape-inference passes that
-    run on CPU tensors).
+    Kernels are registered permanently in the C++ dispatcher by
+    ``_register_spyre_dispatchkey_kernels_permanently()`` (idempotent).
+    Once registered, ``OPWrapper.__call__`` uses ``torch.compiler.is_compiling()``
+    to route dispatch: inside a ``torch.compile`` context the Spyre function is
+    called directly; outside (eager mode) the pre-compiled wrapper is used.
 
-    The CM is reentrant and thread-safe.
+    The CM is reentrant.
     """
-    global _decompositions_via_dispatchkey_nesting
-    with _decompositions_via_dispatchkey_lock:
-        # Ensure the kernels are permanently registered (idempotent).
-        _register_spyre_dispatchkey_kernels_permanently()
-
-        first_enter = (_decompositions_via_dispatchkey_nesting == 0)  # fmt: skip
-        _decompositions_via_dispatchkey_nesting += 1
-
-        if first_enter:
-            for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
-                wrapper_cls.spyre_enabled = True
-
-    try:
-        yield
-    finally:
-        with _decompositions_via_dispatchkey_lock:
-            _decompositions_via_dispatchkey_nesting -= 1
-            last_exit = (_decompositions_via_dispatchkey_nesting == 0)  # fmt: skip
-
-            if last_exit:
-                for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
-                    wrapper_cls.spyre_enabled = False
+    _register_spyre_dispatchkey_kernels_permanently()
+    yield
 
 
 @register_spyre_decomposition([torch.ops.spyre.compact])

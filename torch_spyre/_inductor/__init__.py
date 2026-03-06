@@ -101,7 +101,19 @@ def enable_spyre_compile_fx_wrapper():
                 with enable_spyre_context(
                     example_inputs, decomps=decomps
                 ) as spyre_context_decompositions:
+                    # The per-compilation fresh dict is used by aot_autograd for
+                    # make_fx tracing (correctness).
                     kwargs["decompositions"] = spyre_context_decompositions
+
+                    # Provide a stable module-level callable for upstream
+                    # lazy_init / _sfdp_init so functools.cache keys on a
+                    # single identity across all Spyre compilations instead of
+                    # creating a fresh lambda per call.
+                    from torch_spyre._inductor.decompositions import (
+                        _spyre_get_decomp_fn,
+                    )
+
+                    kwargs.setdefault("get_decomp_fn", _spyre_get_decomp_fn)
 
                     return _orig(
                         gm,
