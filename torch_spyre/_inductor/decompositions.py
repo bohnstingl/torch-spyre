@@ -365,7 +365,7 @@ def enable_spyre_decompositions_via_dispatchkey():
                     wrapper_cls.spyre_enabled = False
 
 
-@decomp.register_decomposition([torch.ops.spyre.compact])
+@register_spyre_decomposition([torch.ops.spyre.compact])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.spyre.slice(torch.ops.spyre.swap(x))
 
