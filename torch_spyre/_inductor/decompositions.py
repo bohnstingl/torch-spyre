@@ -198,12 +198,9 @@ def _register_spyre_dispatchkey_kernels_permanently():
 
     for op, wrapper_cls in spyre_decompositions_via_dispatchkey.items():
         # Autograd key: fall through so that the PrivateUse1 kernel is reached.
-        _spyre_autograd_lib.impl(op._name, fallthrough_kernel, allow_override=True)
+        _spyre_autograd_lib.impl(op._name, fallthrough_kernel)
         # PrivateUse1 key: the OPWrapper dispatches to spyre_fn.
-        # allow_override=True because codegen_ops.py may have already registered a
-        # generic torch.compile-based implementation for the same op; the OPWrapper
-        # with the dedicated Spyre custom op should take precedence.
-        _spyre_lib.impl(op._name, wrapper_cls, allow_override=True)
+        _spyre_lib.impl(op._name, wrapper_cls)
 
     _dispatchkey_kernels_registered = True
 
