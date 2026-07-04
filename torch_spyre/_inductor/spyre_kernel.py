@@ -676,16 +676,52 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
 
     def remove_kernel_local_buffers(self) -> None:
-        """Remove buffers that have a scratchpad or temporary allocation from the kernel's arg list."""
+        """Remove buffers that have a scratchpad or temporary allocation from the kernel's arg list.
+
+        Pool-resident buffers are normally implicit: the SDSC kernel writes to
+        a fixed pool offset baked into its OpSpec, and downstream SDSC kernels
+        read from the same offset — no Python tensor variable is needed. But
+        when a downstream consumer is a FallbackKernel (a
+        ``direct_register_custom_op`` op that survives Inductor as a leaf, e.g.
+        ``spyre_rmsnorm_native``), it dispatches through
+        ``torch.ops.<ns>.<name>(...)`` and DOES need a real ``torch.Tensor``.
+        Stripping the pool buffer then emits ``NameError: name 'bufN' is not
+        defined`` in the generated wrapper. Keep the buffer materialized when
+        any downstream consumer is an Extern/Nop scheduler node so the wrapper
+        emits a Python ``reinterpret_tensor_with_layout(_pool, …)`` view.
+        """
+        from torch._inductor.scheduler import (
+            ExternKernelSchedulerNode,
+            NopKernelSchedulerNode,
+        )
+
+        scheduler = getattr(V.graph, "scheduler", None)
         for name in list(self.store_buffer_names):
             buf = V.graph.get_buffer(name)
             if buf is None:
                 continue
             layout = buf.get_layout()
-            if isinstance(layout, FixedTiledLayout) and (
-                "lx" in layout.allocation or "pool" in layout.allocation
-            ):
+            if not isinstance(layout, FixedTiledLayout):
+                continue
+            if "lx" in layout.allocation:
+                # `lx` buffers are kernel-local scratchpad — never need a
+                # Python handle.
                 self.remove_buffer(name)
+                continue
+            if "pool" in layout.allocation:
+                needs_python_handle = False
+                if scheduler is not None:
+                    sched_buf = getattr(scheduler, "name_to_buf", {}).get(name)
+                    if sched_buf is not None:
+                        for use in sched_buf.users:
+                            if isinstance(
+                                use.node,
+                                (ExternKernelSchedulerNode, NopKernelSchedulerNode),
+                            ):
+                                needs_python_handle = True
+                                break
+                if not needs_python_handle:
+                    self.remove_buffer(name)
 
     def load(self, name: str, index: sympy.Expr):
         """Codegen a load from an InputBuffer"""

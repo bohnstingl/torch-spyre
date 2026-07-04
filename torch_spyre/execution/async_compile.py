@@ -19,6 +19,7 @@ import os
 import subprocess
 import torch
 
+from torch._inductor.async_compile import AsyncCompile
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import (
@@ -40,9 +41,18 @@ def get_output_dir(kernel_name: str):
     return kernel_output_dir
 
 
-class SpyreAsyncCompile:
-    def __init__(self) -> None:
-        pass
+class SpyreAsyncCompile(AsyncCompile):
+    """Async-compile driver for the Spyre backend.
+
+    Inherits the upstream ``AsyncCompile`` so all standard codegen entry
+    points (``cpp_pybinding``, ``cpp``, ``triton``, ``wait`` …) keep working
+    for the CPU-C++ kernels Inductor still emits for host-side ops (e.g. a
+    fused ``clone``/``slice``). Adds ``sdsc`` for compiling Spyre SDSC bundles.
+    Previously this was a standalone class with only ``sdsc``/``wait``; once
+    the generated wrapper contained any non-Spyre kernel it raised
+    ``AttributeError: 'SpyreAsyncCompile' object has no attribute
+    'cpp_pybinding'``.
+    """
 
     def sdsc(
         self, kernel_name: str, specs: Sequence[OpSpec | LoopSpec | UnimplementedOp]
@@ -63,6 +73,3 @@ class SpyreAsyncCompile:
             subprocess.run(["dxp_standalone", "-d", output_dir], check=True)
 
         return SpyreSDSCKernelRunner(kernel_name, output_dir)
-
-    def wait(self, scope: dict[str, Any]) -> None:
-        pass

@@ -26,7 +26,7 @@ from torch._inductor.virtualized import V
 from torch._inductor.sizevars import SizeVarAllocator
 
 from .ir import FixedTiledLayout
-from .constants import SEGMENT_SIZE
+from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 
 
 class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
@@ -63,8 +63,13 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
             """,
             strip=True,
         )
+        # Device-aware reinterpret_tensor: Spyre tensors use the _C binding;
+        # CPU buffers (from fused host kernels feeding CPU custom ops like
+        # spyre_rotary_cpu) delegate to torch's _reinterpret_tensor. The bare
+        # _C binding static_casts to SpyreTensorImpl and crashes with
+        # std::bad_alloc on non-Spyre input. See reinterpret_shim.py.
         self.header.writeline(
-            "from torch_spyre._C import reinterpret_tensor as reinterpret_tensor"
+            "from torch_spyre._inductor.reinterpret_shim import reinterpret_tensor as reinterpret_tensor"
         )
         self.header.writeline(
             "from torch_spyre._C import reinterpret_tensor_with_layout"
@@ -92,10 +97,17 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
                     lines.insert(i, " " * indent + "del _pool")
                     break
 
-            # Add pool allocation before first kernel call (`.run(`).
+            # Add pool allocation before the FIRST line that references `_pool`.
+            # That is normally the first SDSC kernel `.run(...)`, but with the
+            # pool-resident buffer views emitted by `make_buffer_allocation`
+            # (`reinterpret_tensor_with_layout(_pool, ...)` for pool buffers a
+            # downstream FallbackKernel reads), a `_pool` reference can appear
+            # BEFORE the first `.run(`. Injecting only before `.run(` then
+            # leaves those views referencing an undefined `_pool`
+            # (`UnboundLocalError`). Match either form.
             pool_alloc_code = self.allocate_pool()
             for i, line in enumerate(lines):
-                if ".run(" in line:
+                if ".run(" in line or "reinterpret_tensor_with_layout(_pool" in line:
                     indent = len(line) - len(line.lstrip())
                     lines.insert(i, " " * indent + pool_alloc_code)
                     break
@@ -115,6 +127,28 @@ class SpyrePythonWrapperCodegen(PythonWrapperCodegen):
         name = buffer.get_name()
         codegen_shape_tuple = self.codegen_python_shape_tuple(tuple(layout.size))
         codegen_stride_tuple = self.codegen_python_shape_tuple(tuple(layout.stride))
+
+        if "pool" in layout.allocation:
+            # Pool-resident: the SDSC producer kernel wrote this buffer into
+            # `_pool` at a fixed byte offset. When it survives buffer removal
+            # (because a downstream FallbackKernel needs a Python handle — see
+            # spyre_kernel.remove_kernel_local_buffers), materialize a
+            # reinterpret view into `_pool` at that offset rather than a fresh
+            # allocation (which would point at the wrong storage and feed the
+            # FallbackKernel garbage). `_pool` is 1-D uint8 (1 elem = 1 byte),
+            # so offset_increment is the byte offset relative to
+            # INTERMEDIATES_SEGMENT. Pass `dtype=layout.dtype` so the view is
+            # tagged fp16/fp32/... instead of inheriting _pool's uint8.
+            byte_offset = layout.allocation["pool"] - INTERMEDIATES_SEGMENT
+            return (
+                f"{name} = reinterpret_tensor_with_layout("
+                f"_pool, "
+                f"{codegen_shape_tuple}, "
+                f"{codegen_stride_tuple}, "
+                f"{byte_offset}, "
+                f"{layout.device_layout!r}, "
+                f"dtype={layout.dtype})"
+            )
 
         out = (
             f"{name} = spyre_empty_with_layout("
