@@ -34,8 +34,8 @@ Twelve cases:
         counter each step: how a body learns its own tile index without a tile spec.
   G     flash attention's inner KV loop alone: one level, a 3-leaf `(m, denom, acc)`
         online-softmax carry, Q closed over whole. The multi-leaf reduction carry in
-        isolation, and the shape whose carry reaches `scan` untouched -- neither map mode
-        nor the counter workaround applies. Costs nothing at all.
+        isolation, which like every reduction carry reaches `scan` untouched. Costs
+        nothing at all.
   PA_B  a miniature paged attention with both of the body's matmuls tiled along their
         contraction axis, i.e. case C nested inside a page loop: three while_loop levels
         in one kernel.
@@ -785,9 +785,8 @@ class TestForEachTileLowering(unittest.TestCase):
         zero -- three leaves in, three leaves out, no `ys` buffer because `out_dim` is
         None, and no fold because there is no stack to fold. Cases C and PA_D also cost
         nothing, but with a single leaf and no arithmetic respectively; this is the shape
-        a real attention kernel carries, at a real attention size, and it is the one
-        `for_each_tile` shape whose carry the frontend hands over untouched -- a 3-leaf
-        `init` is neither `map_mode` nor `count_mode`, so `scan` sees the user's own
+        a real attention kernel carries, at a real attention size, and the frontend
+        hands its carry over untouched -- outside `map_mode`, `scan` sees the user's own
         pytree and the loop index is `decompose_scan_to_while_loop`'s alone.
 
         The reference is a dense `softmax(Q @ K.T) @ V`, so the recurrence is checked

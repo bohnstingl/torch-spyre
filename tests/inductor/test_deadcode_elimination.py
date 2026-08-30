@@ -178,8 +178,8 @@ class TestDeadMutationElimination(unittest.TestCase):
 class TestForEachTileCarryIsCollected(unittest.TestCase):
     """A ``for_each_tile`` carry nobody reads is collected.
 
-    ``scan`` requires a carry in map mode and a one-leaf reduction needs a
-    second output leaf, so a step counter is supplied that every mode discards.
+    ``scan`` requires a carry, so map mode supplies a step counter that it
+    discards.
     Splicing leaves its whole chain behind, and the pass must collect it.
 
     What the chain lowers to is not the point and will change: whether its ops

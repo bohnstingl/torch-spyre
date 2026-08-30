@@ -67,8 +67,8 @@ does exactly:
     return tmp2
 
 i.e. `lt(iteration_sym, N)` with N a plain Python int/constant baked in by
-the tracer (for_each_tile.py's `_step_counter`/`count_mode` logic always
-carries the trip counter as carried_inputs[0], and the cond subgraph's own
+the tracer (decompose_scan_to_while_loop always carries its own `loop_idx`
+trip counter as carried_inputs[0], and the cond subgraph's own
 first placeholder is that same carry positionally). `N` is not exposed as a
 separate symbolic node anywhere reachable from the IR level -- it only shows
 up as the literal second operand of the `<` -- so rather than parse
@@ -252,9 +252,9 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
 def _body_loop_var(while_op: "ir.WhileLoop") -> sympy.Symbol | None:
     """Find the real per-iteration index symbol the spliced body already uses.
 
-    for_each_tile's frontend always carries the trip counter as
-    carried_inputs[0] (see for_each_tile.py's _step_counter/count_mode
-    logic), so the body subgraph's own first graph input is that same carry
+    decompose_scan_to_while_loop always carries its own trip counter,
+    ``loop_idx``, as carried_inputs[0] (ahead of every for_each_tile
+    carry), so the body subgraph's own first graph input is that same carry
     positionally. decompose_scan_to_while_loop's body lowers each tile's
     scan-index arithmetic to a leading DynamicScalar op that reads that
     first placeholder (via ops.load/.item()) and defines a fresh unbacked
