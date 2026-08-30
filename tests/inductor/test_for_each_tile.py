@@ -14,12 +14,16 @@
 
 """Lowering tests for `for_each_tile`: the loop must reach a `while_loop`, and copy nothing.
 
-Nine cases:
+Twelve cases. Three of them -- `Bw`, `Dw`, `PA_E` -- give the loop the destination its
+tiles belong in (`output=`, which lowers to `scan`'s `out=`) and are the reason the
+others' copy counts are an upper bound rather than a cost:
 
   A     tile M as a map: step `i` takes a row band of X, sees Y whole, and its result
         tile is laid along dim 0 of the output. The map level in its smallest form.
   B     the same loop with the tiles landing along dim 1 instead (N tiled, X invariant),
         which is what makes `scan`'s dim-0 stack cost a second full-size copy.
+  Bw    case B with `output=`: that second copy is gone, and so is the stack it folded.
+        The one remaining copy is the write, which IS the output.
   C     split-K matmul: co-indexed `dims=(-1, 0)` on the shared axis, carry accumulates.
         A plain-`scan` formulation has to copy the whole operand to manufacture a
         leading tile axis; this one does not, which is exactly the HBM traffic working
@@ -27,6 +31,8 @@ Nine cases:
   D     the same matmul with several axes tiled at once -- (M,K), (K,N), (M,K,N) at equal
         and at mixed tile sizes -- one while_loop level per axis, nested map around
         reduction. Variants through one nest builder.
+  Dw    case D's sweep with every map level handed its destination, the inner one
+        allocated inside the outer level's body: one copy per map level, no folds.
   E     case D's (M,K) nest again, as the readable reference for what map mode costs next
         to a reduction: the tile counter carry, the tile write, and the fold that is free
         at `out_dim=0`.
@@ -41,6 +47,11 @@ Nine cases:
   PA_D  the complement of PA_C: the page loop and nothing else. Gather K and V for the
         pages `page_index` names, add a constant, accumulate. Read it for the Gather
         alone -- it copies nothing at all.
+  PA_E  a tiled KV-cache append: `out_dim=Gather`, so each step scatters its tile to the
+        slots the mapping names instead of laying it contiguously. Zero materializations,
+        because a scatter is not one of the names below -- the numbers are what guards
+        against a dropped write, and this is the graph shape (an unused loop result, the
+        write the only thing keeping the loop alive) that needed the `ir.py` fix.
 
 Each case asserts three things about the post-grad graphs, `while_loop` subgraphs
 included:
@@ -48,8 +59,13 @@ included:
   * one `while_loop` node per nest level -- the loop was lifted, not unrolled -- and no
     surviving `scan` node;
   * NO materialization node (`copy`, `clone`, `contiguous`, `cat`, `stack`) beyond the
-    ones listed per case, each of which is something the caller asked for;
+    ones listed per case, each of which is something the caller asked for. The set names
+    the ops that move a whole tensor; a scatter (`index_put_`) is deliberately not in it,
+    since placing one tile is the write itself and not a copy of anything;
   * the numbers, against eager and against a dense reference.
+
+One further test, `test_output_spec_rejections`, stays in eager: it pins the errors the
+`output=`/`out_dim=` combinations raise, including that `output=` is inference-only.
 
 The gathered cases take their page index already contiguous, so nothing the caller does
 to a stick-wide page table lands in the graph. `for_each_tile` raises on a strided index
@@ -77,7 +93,7 @@ import os
 import unittest
 
 import torch
-from torch._inductor.utils import run_and_get_code
+from torch._inductor.utils import fresh_cache, run_and_get_code
 
 from torch_spyre._inductor.wsr import for_each_tile, Gather
 
@@ -204,7 +220,7 @@ def matmul_inputs():
     return (X, Y), X @ Y
 
 
-def nest(axes, tM, tK, tN):
+def nest(axes, tM, tK, tN, use_output=False):
     """A matmul with any subset of {M, K, N} tiled, one `for_each_tile` level each.
 
     Level order is fixed M outside N outside K, so the two map levels place their tiles
@@ -212,6 +228,13 @@ def nest(axes, tM, tK, tN):
     tiles of the one above it, which is what makes the nest compose: tiles are
     rank-preserving, so `dims` means the same thing at every depth and a level cannot
     tell whether its operands are the originals or somebody else's tiles.
+
+    `use_output` hands each map level the buffer its tiles belong in, instead of letting
+    the level stack them and fold afterwards. Both destinations are `torch.empty`: the
+    tiles have to cover every byte, and an uninitialised buffer says so if they do not.
+    The inner one is allocated inside the outer level's body, so it is a destination the
+    loop above is itself writing a tile of -- which is the composition property the
+    parameter has to keep.
     """
 
     def k_level(x, y):
@@ -239,7 +262,10 @@ def nest(axes, tM, tK, tN):
             x_whole, y_tile = ops
             return None, k_level(x_whole, y_tile)
 
-        _, out = for_each_tile(body, (x, y), dims=(None, 1), tile_size=tN, out_dim=1)
+        dest = torch.empty(x.shape[0], y.shape[1]) if use_output else None
+        _, out = for_each_tile(
+            body, (x, y), dims=(None, 1), tile_size=tN, out_dim=1, output=dest
+        )
         return out
 
     def fn(X, Y):
@@ -250,7 +276,10 @@ def nest(axes, tM, tK, tN):
             x_tile, y_whole = ops
             return None, n_level(x_tile, y_whole)
 
-        _, out = for_each_tile(body, (X, Y), dims=(0, None), tile_size=tM, out_dim=0)
+        dest = torch.empty(X.shape[0], Y.shape[1]) if use_output else None
+        _, out = for_each_tile(
+            body, (X, Y), dims=(0, None), tile_size=tM, out_dim=0, output=dest
+        )
         return out
 
     return fn
@@ -327,16 +356,18 @@ class TestForEachTileLowering(unittest.TestCase):
         """
         torch._dynamo.reset()
         eager = fn(*args)
-        with post_grad_graphs() as graphs:
+        with fresh_cache(), post_grad_graphs() as graphs:
             compiled = torch.compile(fn, backend="inductor", fullgraph=True)
             out, code = run_and_get_code(compiled, *args)
 
-        # No `fresh_cache()` needed, unlike its neighbours in this suite: inductor
-        # bypasses the FX graph cache outright for a graph holding a `scan` HOP, which
-        # every case here has by construction, so a warm cache can never skip the
-        # post-grad pass the capture above hooks. Asserted rather than assumed -- if
-        # that ever changes, this says so instead of an IndexError on `graphs[-1]`.
-        self.assertTrue(graphs, "no post-grad graph captured (FX graph cache hit?)")
+        # `fresh_cache()` because what is under test is the pass, and a warm cache skips
+        # it: a hit serves the compiled artifact and `decompose_scan_to_while_loop` never
+        # runs, so nothing is captured. Inductor does bypass its cache for some graphs
+        # holding a HOP, but not for the inference-mode ones the `output=` cases trace,
+        # and a suite whose assertions depend on which is which is a suite that passes
+        # once. Asserted as well as arranged, so a regression says so here rather than as
+        # an IndexError on `graphs[-1]`.
+        self.assertTrue(graphs, "no post-grad graph captured (cache hit?)")
 
         # The decomposition runs bottom-up, one module at a time, so the graph captured
         # last is the top-level one and the rest are the subgraphs it now contains.
@@ -418,6 +449,42 @@ class TestForEachTileLowering(unittest.TestCase):
             fn, args, ref, name="B_split_n", loops=1, materializations=2
         )
 
+    @torch.no_grad()
+    def test_split_n_write_in_place(self):
+        """Bw: case B handed the buffer its tiles belong in -- B's second copy is gone.
+
+        The only difference from B is `output=`, and it removes exactly what B's
+        docstring says it would: `scan` writes each `(8, 2)` tile straight into
+        `narrow(1, 2*i, 2)` of the caller's `(8, 6)` buffer, so there is no `(3, 8, 2)`
+        stack to fold and no `(8, 3, 2)` clone to fold it into. One materialization
+        remains and it IS the output, the same per-step write case A pays.
+
+        `out_dim` has become a stride rather than a post-loop reshape: the destination
+        reaches the loop as `as_strided(buf, [3, 8, 2], [2, 6, 1])` and the body does
+        `select(0, i).copy_(tile)`, a contiguous slice of the caller's buffer.
+        Measured, the wrapper's allocations go from `(8,2) + (3,8,2) + (8,3,2)` to
+        `(8,2) + (8,6)`: 117 elements down to 69, and the output written once.
+
+        Inference-only, hence `no_grad`: the write is `scan`'s in-place mutation route
+        (`for_each_tile` says so rather than letting dynamo fail deeper down).
+        """
+        args, ref = matmul_inputs()
+
+        def fn(X, Y):
+            def body(_, ops):
+                x_whole, y_tile = ops
+                return None, x_whole @ y_tile
+
+            dest = torch.empty(M, N)
+            _, out = for_each_tile(
+                body, (X, Y), dims=(None, 1), tile_size=2, out_dim=1, output=dest
+            )
+            return out
+
+        self._assert_lowers(
+            fn, args, ref, name="Bw_split_n_output", loops=1, materializations=1
+        )
+
     def test_split_k(self):
         """C: co-indexed `dims=(-1, 0)` on the shared axis, carry accumulates.
 
@@ -474,6 +541,39 @@ class TestForEachTileLowering(unittest.TestCase):
                         name=f"D_nest_{axes}_{sizes}",
                         loops=len(axes),
                         materializations=("M" in axes) + 2 * ("N" in axes),
+                    )
+
+    @torch.no_grad()
+    def test_nested_matmul_tilings_write_in_place(self):
+        """Dw: case D's sweep with every map level given its destination.
+
+        One copy per map level and nothing else -- `("M" in axes) + ("N" in axes)`,
+        where D pays `("M" in axes) + 2 * ("N" in axes)`. The N level's extra copy was
+        the fold of a stack that no longer exists, so the whole inventory collapses to
+        "one write per output, one output per map level":
+
+          * MK  1 -> 1   (M's fold was already a view; only the allocation is saved)
+          * KN  2 -> 1
+          * MKN 3 -> 2
+
+        The nest is what makes this more than case Bw twice: the N level's destination
+        is allocated inside the M level's body, so the M level is writing a tile of a
+        buffer whose own tiles came from a loop one level down. Neither level knows the
+        other owns any part of it, which is the property `output=` had to keep -- a
+        destination is just a strided view, and a view of a view is a view.
+        """
+        args, ref = matmul_inputs()
+        for axes in self.NEST_AXES:
+            for sizes in self.NEST_SIZES:
+                with self.subTest(axes=axes, sizes=sizes):
+                    tM, tK, tN = (2, 2, 2) if sizes == "same" else (4, 3, 2)
+                    self._assert_lowers(
+                        nest(axes, tM, tK, tN, use_output=True),
+                        args,
+                        ref,
+                        name=f"Dw_nest_{axes}_{sizes}_output",
+                        loops=len(axes),
+                        materializations=("M" in axes) + ("N" in axes),
                     )
 
     def test_map_outside_reduction(self):
@@ -777,6 +877,125 @@ class TestForEachTileLowering(unittest.TestCase):
             loops=1,
             materializations=0,
         )
+
+    @torch.no_grad()
+    def test_scatter_tile_writes(self):
+        """PA_E: `out_dim=Gather` -- PA_D's gather run backwards, as a KV-cache append.
+
+        The write dual of a gathered read, and the one output spec that is not a
+        placement `scan` could express: step `i` sends its `(2, NKV, HS)` token tile to
+        the slots `slot_mapping[i]` names, `pool.index_copy_(0, slot_mapping[i], tile)`,
+        which is tiled `_reshape_and_cache`. The slots are deliberately out of order and
+        do not cover the pool, so the reference pins both what was written and what was
+        left alone.
+
+        There is no destination view to write through here, because the positions are
+        data rather than an offset the loop can compute: `pool` reaches the loop as a
+        lifted additional input the body mutates, and `scan` returns no per-step output
+        at all. So the loop's own result is the tile counter map mode threads anyway,
+        which nothing reads -- `while_loop = None` in the graph, the whole loop kept
+        alive by the write alone. That is the exact shape S5 got wrong (the scheduler
+        dropped such a loop and the buffer stayed zero), which is why this case waited
+        for the `while_loop` mutation fixes rather than shipping in Phase 1, and why the
+        assertion that matters here is the numbers: a dropped write reads as zeros.
+
+        Zero materializations, and that is not the write going missing. It lowers to
+        `index_put_(pool, [slots_i], tile)`, a scatter of one tile, which `MATERIALIZE`
+        deliberately does not name -- what it names are the whole-tensor copies a tiling
+        can be made to avoid. `dtype` covers both tables `Gather` accepts: `index_copy_`
+        takes int64 only, so an int32 page table -- which is what Spyre's is -- adds a
+        `convert_element_type` of the `(3, 2)` table, hoisted out of the loop, and not a
+        copy of any data.
+        """
+        NTOK, TOK_TILE = 6, 2
+        SLOTS = POOL_PAGES * BLOCK
+        torch.manual_seed(0)
+        key = torch.randn(NTOK, NKV, HS)
+        slots = [[8, 9], [4, 5], [20, 21]]
+
+        for dtype in (torch.int64, torch.int32):
+            with self.subTest(dtype=dtype):
+                slot_mapping = torch.tensor(slots, dtype=dtype)
+                ref = torch.zeros(SLOTS, NKV, HS)
+                ref.index_copy_(0, slot_mapping.reshape(-1).long(), key * 2.0)
+
+                def fn(key, slot_mapping):
+                    pool = torch.zeros(SLOTS, NKV, HS)
+
+                    def body(_, ops):
+                        # Stands in for the real kernel's per-tile cast/scale.
+                        return None, ops[0] * 2.0
+
+                    _, out = for_each_tile(
+                        body,
+                        (key,),
+                        dims=(0,),
+                        tile_size=TOK_TILE,
+                        output=pool,
+                        out_dim=Gather(0, slot_mapping),
+                    )
+                    return out
+
+                self._assert_lowers(
+                    fn,
+                    (key, slot_mapping),
+                    ref,
+                    name=f"PA_E_scatter_{dtype}",
+                    loops=1,
+                    materializations=0,
+                )
+
+    def test_output_spec_rejections(self):
+        """Every `output=`/`out_dim` pairing that is an error, checked eagerly.
+
+        The frontend raises before it reaches `scan`, so these need no compile. Each
+        message names the parameter the caller has to change, because the failure mode
+        this guards against is a destination that silently ends up half written.
+        """
+        X, Y = matmul_inputs()[0]
+
+        def body(_, ops):
+            return None, ops[0] @ ops[1]
+
+        def call(**kwargs):
+            with torch.no_grad():
+                for_each_tile(body, (X, Y), tile_size=2, **kwargs)
+
+        cases = [
+            ("needs out_dim", dict(dims=(0, None), output=torch.empty(M, N))),
+            ("needs output=", dict(dims=(0, None), out_dim=Gather(0, torch.zeros(4)))),
+            (
+                "not a multiple of the 4 tiles",
+                dict(dims=(0, None), out_dim=1, output=torch.empty(M, 5)),
+            ),
+            (
+                "reverse=True",
+                dict(dims=(0, None), out_dim=1, output=torch.empty(M, N), reverse=True),
+            ),
+            (
+                "but the loop runs 4 tiles",
+                dict(
+                    dims=(0, None),
+                    out_dim=Gather(0, torch.zeros(3, dtype=torch.int64)),
+                    output=torch.empty(M, N),
+                ),
+            ),
+        ]
+        for message, kwargs in cases:
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message):
+                    call(**kwargs)
+
+        # Inference-only, and said so here rather than by dynamo three frames deeper.
+        with self.assertRaisesRegex(RuntimeError, "inference-only"):
+            for_each_tile(
+                body,
+                (X, Y),
+                dims=(0, None),
+                tile_size=2,
+                out_dim=0,
+                output=torch.empty(M, N),
+            )
 
 
 if __name__ == "__main__":

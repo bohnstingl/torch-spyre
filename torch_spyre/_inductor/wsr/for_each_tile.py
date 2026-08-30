@@ -19,6 +19,14 @@
 that reduces every operand to a per-step tile -- a `narrow` view, a whole
 invariant, or a gathered pool row -- threads an optional carry, and optionally
 lays each step's result tile back into a full-size output along one axis.
+
+The destination of that lay-back is the caller's, via `output=`. `scan` grew an
+`out=` parameter for it, so the tile write goes straight into the buffer the caller
+already owns: no stacked scratch, and no post-loop fold. Without `output=` the loop
+falls back to `scan`'s own stacked buffer, which costs a full-size copy of the result
+for any `out_dim != 0` (`_stacked_to_full`) -- the frontend cannot avoid it, because
+it does not learn the output tile's shape until `body` has run and so has nothing to
+allocate.
 """
 
 import contextlib
@@ -44,6 +52,10 @@ class Gather:
 
     `index` is a contiguous 1-D integer tensor and its length corresponds to the
     loop's trip count.
+
+    As an `out_dim` it is the write dual -- step `i` does
+    `output.index_copy_(axis, index[i], y_i)` -- and then `index` may also be
+    `[num_tiles, w]`, one row of `w` destination positions per step.
     """
 
     axis: int
@@ -244,9 +256,103 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     `num_tiles * extent`. For dim == 0 this is a view, (4, 2, 6) -> (8, 6) on the same
     storage, since the flatten merges two contiguous leading axes. For dim != 0 the
     flatten crosses the moved axis, which strides cannot express, so it copies the whole
-    output ((3, 8, 2) -> (8, 6)); Phase 7 removes that by writing tile i in place.
+    output ((3, 8, 2) -> (8, 6)); `output=` removes that by writing tile i in place.
     """
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
+
+
+def _dest_view(output: torch.Tensor, axis: int, num_tiles: int) -> torch.Tensor:
+    """`scan`'s `out=` destination for a tiled write: [num_tiles, *tile] over `output`.
+
+    Splitting `axis` into (num_tiles, extent) and moving the tile axis to the front are
+    both pure stride permutations, so what `scan` writes through and what the caller
+    handed over are the same storage: `out_dim` has become a stride. That is why there
+    is nothing to fold afterwards -- compare `_stacked_to_full`, which has to place the
+    tiles after the fact and cannot express `out_dim != 0` as strides at all.
+    """
+    extent = output.shape[axis] // num_tiles
+    return _movedim(output.unflatten(axis, (num_tiles, extent)), axis, 0)
+
+
+def _normalize_out_spec(output, out_dim, num_tiles: int, reverse: bool):
+    """Validate `output` against `out_dim` and the trip count.
+
+    Returns the `out_dim=Gather` index table, cast to the dtype `index_copy_` demands,
+    or `None` for the sliced and reduction cases.
+    """
+    if out_dim is None:
+        if output is not None:
+            raise ValueError(
+                "for_each_tile() output= needs out_dim=; a destination the body writes "
+                "whole every step is a carry, pass it as init="
+            )
+        return None
+
+    if output is not None:
+        if not isinstance(output, torch.Tensor):
+            raise ValueError(
+                f"for_each_tile() output must be a Tensor, got {type(output)}"
+            )
+        if torch.is_grad_enabled():
+            # The write is `scan`'s in-place mutation route, which carries no gradient
+            # for the destination; dynamo refuses the mutating body outright.
+            raise RuntimeError(
+                "for_each_tile() output= is inference-only, because a destination "
+                "written in place cannot be differentiated. Wrap the call in "
+                "torch.no_grad() or torch.inference_mode()."
+            )
+
+    if isinstance(out_dim, Gather):
+        if output is None:
+            raise ValueError(
+                "for_each_tile() out_dim=Gather needs output=: a scatter of tiles has "
+                "nowhere to go without the destination to scatter into"
+            )
+        idx = out_dim.index
+        if not isinstance(idx, torch.Tensor) or idx.ndim not in (1, 2):
+            shape = tuple(idx.shape) if isinstance(idx, torch.Tensor) else type(idx)
+            raise ValueError(
+                f"for_each_tile() out_dim=Gather index must be a 1-D or 2-D tensor, "
+                f"got {shape}"
+            )
+        if idx.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                f"for_each_tile() out_dim=Gather index must be int32 or int64, got "
+                f"{idx.dtype}"
+            )
+        if not idx.is_contiguous():
+            raise ValueError(
+                f"for_each_tile() out_dim=Gather index must be contiguous, got strides "
+                f"{tuple(idx.stride())}; pass index.contiguous()"
+            )
+        if idx.shape[0] != num_tiles:
+            raise ValueError(
+                f"for_each_tile() out_dim=Gather index has {idx.shape[0]} rows but the "
+                f"loop runs {num_tiles} tiles"
+            )
+        # `index_copy_` takes an int64 index only, while a Spyre page table is int32.
+        # The cast is of the table, not of the data, and only when it is needed.
+        return idx if idx.dtype is torch.int64 else idx.to(torch.int64)
+
+    if not isinstance(out_dim, int) or isinstance(out_dim, bool):
+        raise ValueError(
+            f"for_each_tile() out_dim must be an int, a Gather or None, got {out_dim!r}"
+        )
+    if output is None:
+        return None
+    if reverse:
+        # The write position is `select(0, step)` of the destination view, so a reversed
+        # visit would lay tile i at position num_tiles-1-i. `scan` reverses by flipping,
+        # which is a copy and needs a buffer of its own, i.e. exactly what output= is
+        # here to avoid.
+        raise ValueError("for_each_tile() output= is not supported with reverse=True")
+    axis = utils.canonicalize_dim(output.ndim, out_dim)
+    if output.shape[axis] % num_tiles != 0:
+        raise ValueError(
+            f"for_each_tile() output has size {output.shape[axis]} along dim {out_dim}, "
+            f"which is not a multiple of the {num_tiles} tiles the loop produces"
+        )
+    return None
 
 
 def for_each_tile(
@@ -256,6 +362,7 @@ def for_each_tile(
     dims,
     tile_size: int,
     init=None,
+    output=None,
     out_dim=None,
     reverse: bool = False,
 ):
@@ -276,23 +383,26 @@ def for_each_tile(
             derived: ``shape[dim] // tile_size`` per sliced operand, ``len(index)`` per
             gathered one. All of them must agree.
         init: carry init (tensor or pytree of tensors); ``None`` means no carry.
+        output: destination for the result tiles, mutated in place and also returned,
+            following the ``out=`` convention. Requires ``out_dim`` and grad mode
+            disabled. Omitting it makes the loop allocate a stacked buffer and fold it,
+            which costs a full-size copy of the result for ``out_dim != 0``.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the returned output. ``None`` means the body emits no tile.
+            of the output, ``extent = output.shape[d] // num_tiles``.
+            ``Gather(axis, index)`` scatters it instead, at
+            ``output.index_copy_(axis, index[i], tile)``, and needs ``output``.
+            ``None`` means the body emits no tile.
         reverse: visit tiles high to low. The output still lands in natural order.
+            Not available together with ``output`` and an ``int`` ``out_dim``.
 
     Returns:
-        ``(final_carry, out)``, either of which is ``None`` for the unused mode.
+        ``(final_carry, out)``, either of which is ``None`` for the unused mode. ``out``
+        is ``output`` itself whenever that was given.
     """
     operands = tuple(operands)
     specs, num_tiles = _normalize_in_specs(operands, dims, tile_size)
+    scatter_index = _normalize_out_spec(output, out_dim, num_tiles, reverse)
 
-    if isinstance(out_dim, Gather):
-        # A scattered write is only meaningful with a destination to scatter into.
-        # There is a plan to implement an `output` parameter that the user can
-        # provide for an in-place update. Not yet implemented.
-        raise NotImplementedError(
-            "for_each_tile() out_dim=Gather is not supported yet."
-        )
     if init is None and out_dim is None:
         raise ValueError("for_each_tile() needs init= (reduction) or out_dim= (map)")
 
@@ -308,6 +418,11 @@ def for_each_tile(
     xs = tuple(
         _xs_leaf(o, s) for o, s in zip(operands, specs) if s.kind is not Kind.INVARIANT
     )
+    if scatter_index is not None:
+        # The index table rides as an `xs` leaf, exactly as a gathered operand's does,
+        # so the step's destination positions arrive with its tiles.
+        xs += (scatter_index,)
+        scatter_axis = utils.canonicalize_dim(output.ndim, out_dim.axis)
 
     def combine_fn(carry, sliced):
         # In map mode, the step counter is the whole carry.
@@ -321,6 +436,13 @@ def for_each_tile(
         next_carry, y = body(carry, tiles)
         if map_mode:
             next_carry = step + 1
+        if scatter_index is not None:
+            # The scatter is the step's output: `output` reaches the loop as a lifted
+            # additional input that the body mutates, which is the one write route
+            # `scan` documents for pre-allocated buffers, so nothing is stacked and
+            # there is no per-step result to return.
+            output.index_copy_(scatter_axis, next(it).reshape(-1), y)
+            return next_carry, ()
         return next_carry, (() if out_dim is None else y)
 
     # specialize_float: a Python float closed over by the body
@@ -333,11 +455,22 @@ def for_each_tile(
         if torch.compiler.is_dynamo_compiling()
         else torch._dynamo.config.patch(specialize_float=True)
     )
+    dest = (
+        None
+        if output is None or scatter_index is not None
+        else _dest_view(output, utils.canonicalize_dim(output.ndim, out_dim), num_tiles)
+    )
     with ctx:
-        final_carry, ys = scan(combine_fn, scan_init, xs, dim=0, reverse=reverse)
+        final_carry, ys = scan(
+            combine_fn, scan_init, xs, dim=0, reverse=reverse, out=dest
+        )
 
     if out_dim is None:
         return (None if map_mode else final_carry), None
+    if output is not None:
+        # Written in place, either through `dest` or by the body's own scatter, so `ys`
+        # is a view of `output` or empty. Hand back what the caller owns.
+        return (None if map_mode else final_carry), output
 
     if isinstance(ys, (list, tuple)):
         raise ValueError(
