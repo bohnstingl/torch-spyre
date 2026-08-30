@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
-from torch.utils._pytree import tree_leaves
 
 
 __all__ = ["Gather", "for_each_tile"]
@@ -234,7 +233,7 @@ def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.
 
 
 def _step_counter(like: torch.Tensor) -> torch.Tensor:
-    """The int64 scalar `scan` carry both modes use when the caller supplies none."""
+    """The int64 scalar `scan` carry map mode uses when the caller supplies none."""
     return torch.zeros((), dtype=torch.int64, device=like.device)
 
 
@@ -306,29 +305,13 @@ def for_each_tile(
     else:
         scan_init = init
 
-    # WORKAROUND: A `scan` whose TOTAL flat output is a single tensor does not lower: Inductor's
-    # pattern matcher cannot tell a packed one-element return from a 1:1 replacement and
-    # leaves the node's `getitem` users on the replacement value, so lowering hits
-    # `<built-in function getitem> is not an OpOverload`.
-    # A reduction level with one carry leaf and no per-step output is exactly that
-    # shape, so it carries a step counter beside its accumulator to make the count two.
-    # An extra CARRY leaf, not an extra `ys` leaf: the counter is a scalar the body
-    # increments, whereas a padded per-step output costs a stacked buffer for the whole
-    # trip count and an `aten.copy_` in the innermost body graph.
-    init_leaves = [] if map_mode else tree_leaves(init)
-    count_mode = out_dim is None and len(init_leaves) == 1
-    if count_mode:
-        scan_init = (_step_counter(init_leaves[0]), init)
-
     xs = tuple(
         _xs_leaf(o, s) for o, s in zip(operands, specs) if s.kind is not Kind.INVARIANT
     )
 
     def combine_fn(carry, sliced):
         # In map mode, the step counter is the whole carry.
-        if count_mode:
-            step, carry = carry
-        elif map_mode:
+        if map_mode:
             step, carry = carry, None
         it = iter(sliced)
         tiles = tuple(
@@ -338,8 +321,6 @@ def for_each_tile(
         next_carry, y = body(carry, tiles)
         if map_mode:
             next_carry = step + 1
-        elif count_mode:
-            next_carry = (step + 1, next_carry)
         return next_carry, (() if out_dim is None else y)
 
     # specialize_float: a Python float closed over by the body
@@ -354,9 +335,6 @@ def for_each_tile(
     )
     with ctx:
         final_carry, ys = scan(combine_fn, scan_init, xs, dim=0, reverse=reverse)
-
-    if count_mode:
-        _, final_carry = final_carry
 
     if out_dim is None:
         return (None if map_mode else final_carry), None
