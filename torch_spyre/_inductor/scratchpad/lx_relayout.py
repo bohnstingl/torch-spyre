@@ -14,10 +14,11 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
 from collections.abc import Mapping, Sequence
-from typing import Literal, cast
+from typing import cast
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -32,10 +33,15 @@ from torch_spyre._C import ElementArrangement
 
 from .. import config
 from ..core_mapping import (
+    core_mappings_equal,
+    owner_slots,
     partition_physical_span_bytes,
-    select_partition_division_matching_physical_ownership,
+    _loop_regions,
+    _LOOP_POINT,
+    _MAX_EXACT_DIRECT_AXIS_POINTS,
+    _MAX_EXACT_OWNERSHIP_POINTS,
+    _EVALUATION_ERRORS,
     select_unique_partition_division,
-    work_division_matches_physical_ownership,
 )
 from ..ir import FixedTiledLayout
 from ..logging_utils import get_inductor_logger
@@ -45,6 +51,7 @@ from ..pass_utils import (
     PerCoreView,
     _is_matmul_op,
     _per_core_view_on_buf,
+    completed_reduction_split_on_buf,
     commit_tensor_work_division,
     iteration_space_from_op,
     op_read_writes,
@@ -58,38 +65,17 @@ _REGISTRY = "_spyre_lx_relayout_copies"
 
 
 @dataclasses.dataclass(frozen=True)
-class RelayoutDimension:
-    """One axis's partition refinement, not the transfer graph's fanout.
-
-    ``multiplicity`` measures this axis's split ratio. A broadcast can also
-    add receiving cores without changing any axis splits; its receiver count
-    comes from the source/destination owner maps and shared transfer edges.
-    """
-
-    device_dim: int
-    source_split: int
-    destination_split: int
-    group_count: int
-    group_size: int
-    multiplicity: int
-    ordering_tag: Literal["uniform_groups", "view_pair"]
-
-
-@dataclasses.dataclass(frozen=True)
 class LXRelayoutPlan:
     source_name: str
     consumer_names: tuple[str, ...]
     source_view: PerCoreView
     destination_view: PerCoreView
     num_cores: int
-    group_geometry: tuple[RelayoutDimension, ...] = ()
     source_footprint_bytes: int = 0
     destination_footprint_bytes: int = 0
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
     source_address: int | None = None
     destination_address: int | None = None
-    # Lowering names are registry keys rather than a closed type. Extension
-    # PRs add certifiers without reopening the foundational kind field.
-    kind: str = "shuffle"
 
     @property
     def destination_name(self) -> str:
@@ -100,100 +86,150 @@ class LXRelayoutPlan:
         return self.source_name, self.destination_name
 
 
-def _owner_slots_equal(
-    left: sympy.Expr,
-    right: sympy.Expr,
-    split: int,
-    num_cores: int | None,
-) -> bool:
-    """Whether two slot formulas select the same slice on every core."""
-
-    return PerCoreView(((0, split),), ((0, left),), num_cores=num_cores).same_partition(
-        PerCoreView(((0, split),), ((0, right),), num_cores=num_cores)
-    )
-
-
 def work_division_from_view(
     view: PerCoreView | None,
     device_size: Sequence[int],
     device_coordinates: Sequence[sympy.Expr],
     iteration_space: Mapping[sympy.Symbol, sympy.Expr],
 ) -> TensorWorkDivision | None:
-    """Project physical per-core ownership into operation-loop symbols."""
-
+    """Interpret physical slices through an access, without choosing new owners."""
     if view is None:
         return None
-    if view.num_cores is None or view.num_cores <= 0:
+    n = view.num_cores
+    if n is None or n <= 0:
         raise ValueError("LX ownership must carry its physical core domain")
-    loop_symbols = set(iteration_space)
-    splits: dict[sympy.Symbol, int] = {}
-    core_map: dict[sympy.Symbol, sympy.Expr] = {}
-    slots = dict(view.core_to_slot)
-    if dict(view.work_slice_dims).keys() != slots.keys():
-        raise ValueError("LX ownership split and owner-slot dimensions differ")
-    ownership_by_loop: dict[sympy.Symbol, list[tuple[int, int, sympy.Expr]]] = {}
-    for device_dim, split in view.work_slice_dims:
-        if device_dim >= len(device_coordinates):
-            raise ValueError(f"missing device coordinate {device_dim}")
-        matches = device_coordinates[device_dim].free_symbols & loop_symbols
-        if len(matches) != 1:
-            raise ValueError(f"cannot map device dimension {device_dim} to one loop")
-        dim = next(iter(matches))
-        slot = sympy.sympify(slots[device_dim])
-        ownership_by_loop.setdefault(dim, []).append((device_dim, split, slot))
-
-    fused_loops: list[sympy.Symbol] = []
-    for dim, ownerships in ownership_by_loop.items():
-        _, split, slot = ownerships[0]
-        same_ownership = all(
-            other_split == split
-            and _owner_slots_equal(slot, other_slot, split, view.num_cores)
-            for _, other_split, other_slot in ownerships
-        )
-        if len(ownerships) == 1:
-            splits[dim] = split
-            core_map[dim] = slot
-            continue
-        # Several physical axes driven by one loop are a fused-axis claim even
-        # when their split and slot formulas look identical.  Equal formulas
-        # can still denote diagonal physical regions that no single contiguous
-        # loop partition represents, so the exact ownership proof below must
-        # judge every multi-axis case.
-        fused_loops.append(dim)
-        splits[dim] = (
-            split if same_ownership else math.prod(item[1] for item in ownerships)
-        )
-
-    loop_extents = {
-        dim: value[0] if isinstance(value, tuple) else value
-        for dim, value in iteration_space.items()
-    }
-    if fused_loops:
-        dimensions = tuple(dim for dim in iteration_space if dim in splits)
-        candidate = select_partition_division_matching_physical_ownership(
-            dimensions,
-            splits,
-            loop_extents,
-            device_size,
-            device_coordinates,
-            view.work_slice_dims,
-            view.core_to_slot,
-            view.num_cores,
-        )
-        if candidate is None:
-            raise ValueError(f"conflicting ownership for loop {fused_loops[0]}")
-        return candidate
-    candidate = TensorWorkDivision(splits, core_map, num_cores=view.num_cores)
-    if not work_division_matches_physical_ownership(
-        candidate,
-        loop_extents,
-        device_size,
-        device_coordinates,
-        view.work_slice_dims,
-        view.core_to_slot,
-        view.num_cores,
+    physical_splits, slots = dict(view.work_slice_dims), dict(view.core_to_slot)
+    if len(device_size) != len(device_coordinates):
+        raise ValueError("sizes and coordinates differ in rank")
+    if len(physical_splits) != len(view.work_slice_dims) or len(slots) != len(
+        view.core_to_slot
     ):
-        raise ValueError("physical ownership is not exactly expressible in loop space")
+        raise ValueError("duplicate physical dimensions")
+    rows = owner_slots(slots, physical_splits, n)
+    axes_by_loop: dict[sympy.Symbol, list[int]] = {}
+    for axis, split in physical_splits.items():
+        if (
+            not 0 <= axis < len(device_size)
+            or sympy.sympify(device_size[axis]).is_Integer is not True
+            or device_size[axis] <= 0
+            or device_size[axis] % split
+        ):
+            raise ValueError(
+                f"unsupported ownership input: axis {axis} not divisible by {split}"
+            )
+        symbols = device_coordinates[axis].free_symbols
+        if len(symbols) != 1 or not symbols <= iteration_space.keys():
+            raise ValueError(f"cannot map device dimension {axis} to one loop")
+        axes_by_loop.setdefault(next(iter(symbols)), []).append(axis)
+
+    any_fused = any(len(axes) > 1 for axes in axes_by_loop.values())
+    splits, owners, expected = {}, {}, {}
+    fused_states = 0
+    for loop, axes in axes_by_loop.items():
+        extent = iteration_space[loop]
+        extent = sympy.sympify(extent[0] if isinstance(extent, tuple) else extent)
+        if extent.is_Integer is not True or extent <= 0:
+            raise ValueError(
+                f"unsupported ownership input: loop extent {extent} is not concrete"
+            )
+        extent = int(extent)
+        first = axes[0]
+        same = all(
+            physical_splits[a] == physical_splits[first]
+            and core_mappings_equal({loop: slots[a]}, {loop: slots[first]}, n)
+            for a in axes
+        )
+        split = (
+            physical_splits[first]
+            if same
+            else math.prod(physical_splits[a] for a in axes)
+        )
+        splits[loop] = split
+        if len(axes) == 1:
+            stick = len(device_size) - 1
+            if (
+                first != stick
+                and stick not in physical_splits
+                and loop in device_coordinates[-1].free_symbols
+            ):
+                padded = int(device_size[first] * device_size[-1])
+                if padded - device_size[-1] < extent <= padded:
+                    extent = padded
+            if extent > _MAX_EXACT_DIRECT_AXIS_POINTS:
+                raise ValueError(
+                    f"proof limit: direct axis needs {extent} points; limit is {_MAX_EXACT_DIRECT_AXIS_POINTS}"
+                )
+        else:
+            fused_states += extent + split
+            if fused_states > _MAX_EXACT_OWNERSHIP_POINTS:
+                raise ValueError(
+                    f"proof limit: fused axes need {fused_states} states; limit is {_MAX_EXACT_OWNERSHIP_POINTS}"
+                )
+        if extent % split:
+            raise ValueError(
+                f"unsupported ownership input: loop {loop} not divisible by {split}"
+            )
+        try:
+            bounds = _loop_regions(
+                extent,
+                tuple(
+                    device_coordinates[a].xreplace({loop: _LOOP_POINT}) for a in axes
+                ),
+                tuple(int(device_size[a]) for a in axes),
+                split,
+            )
+        except _EVALUATION_ERRORS as exc:
+            raise ValueError(
+                f"unsupported ownership evaluation: {type(exc).__name__}: {exc}"
+            ) from exc
+        widths = [int(device_size[a]) // physical_splits[a] for a in axes]
+        signatures = [
+            tuple(low // width for (low, _), width in zip(region, widths))
+            for region in bounds
+        ]
+        if any(
+            low // width != high // width
+            for region in bounds
+            for (low, high), width in zip(region, widths)
+        ):
+            raise ValueError(
+                "ownership mismatch: one loop partition crosses physical slices"
+            )
+        if len(set(signatures)) != split:
+            raise ValueError(
+                "ownership mismatch: loop partitions do not cover distinct physical slices"
+            )
+        try:
+            table = tuple(signatures.index(tuple(row[a] for a in axes)) for row in rows)
+        except ValueError:
+            raise ValueError(
+                "ownership mismatch: a core owns slices no loop partition covers"
+            ) from None
+        if set(table) != set(range(split)) or (
+            not any_fused and signatures != [(p,) for p in range(split)]
+        ):
+            raise ValueError(
+                "ownership mismatch: loop and physical slices have different core owners"
+            )
+        expected[loop] = table
+        owners[loop] = slots[first]
+
+    if not any_fused:
+        return TensorWorkDivision(splits, owners, num_cores=n)
+    # The physical slices already determine every loop owner. Search only for
+    # the existing supported spelling, never re-prove the access per candidate.
+    expected_rows = tuple(
+        {loop: table[core] for loop, table in expected.items()} for core in range(n)
+    )
+    candidate = select_unique_partition_division(
+        tuple(loop for loop in iteration_space if loop in splits),
+        splits,
+        n,
+        lambda division: owner_slots(division.core_id_to_work_slice, splits, n)
+        == expected_rows,
+    )
+    if candidate is None:
+        raise ValueError("no unique certified canonical mapping for fused ownership")
     return candidate
 
 
@@ -252,145 +288,15 @@ def demote_lx_relayout_group(
 
 
 def _core_slices(view: PerCoreView, num_cores: int) -> dict[int, dict[int, int]]:
-    if num_cores <= 0:
-        raise ValueError(f"physical core count must be positive, got {num_cores}")
-    if view.num_cores is not None:
-        if view.num_cores <= 0:
-            raise ValueError(
-                f"physical core count must be positive, got {view.num_cores}"
-            )
-        if view.num_cores != num_cores:
-            raise ValueError(
-                "ownership core count differs from the communication domain: "
-                f"{view.num_cores} != {num_cores}"
-            )
-    core_id = sympy.Symbol("core_id")
-    splits = dict(view.work_slice_dims)
-    slots = dict(view.core_to_slot)
-    if splits.keys() != slots.keys():
+    if view.num_cores is not None and view.num_cores <= 0:
+        raise ValueError(f"physical core count must be positive, got {view.num_cores}")
+    if view.num_cores is not None and view.num_cores != num_cores:
         raise ValueError(
-            "ownership split and owner-slot dimensions differ: "
-            f"{sorted(splits)} != {sorted(slots)}"
+            "ownership core count differs from the communication domain: "
+            f"{view.num_cores} != {num_cores}"
         )
-    result = {}
-    for core in range(num_cores):
-        row = {}
-        for dim, split in splits.items():
-            value = sympy.sympify(slots[dim]).subs(core_id, core)
-            if value.free_symbols or value.is_integer is not True:
-                raise ValueError(f"non-integral owner slot {value} on core {core}")
-            slot = int(value)
-            if not 0 <= slot < split:
-                raise ValueError(
-                    f"owner slot {slot} outside split {split} on core {core}"
-                )
-            row[dim] = slot
-        result[core] = row
-    return result
-
-
-def _grouped_gather_geometry(
-    source: PerCoreView, destination: PerCoreView, num_cores: int
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    """Classify a gather ownership pattern.
-
-    Each source core contributes one fragment to a complete destination slice.
-    Destination ownership is validated separately from this communication
-    class, including cases where several consumers need that slice.
-    """
-
-    source_splits = dict(source.work_slice_dims)
-    destination_splits = dict(destination.work_slice_dims)
-    if math.prod(source_splits.values()) != num_cores:
-        return None
-    destination_owners = math.prod(destination_splits.values())
-    if not 0 < destination_owners < num_cores:
-        return None
-
-    dimensions = tuple(dict.fromkeys((*source_splits, *destination_splits)))
-    for dim in dimensions:
-        source_split = source_splits.get(dim, 1)
-        destination_split = destination_splits.get(dim, 1)
-        if source_split < destination_split or source_split % destination_split:
-            return None
-
-    if (
-        destination_owners
-        * math.prod(
-            source_splits.get(dim, 1) // destination_splits.get(dim, 1)
-            for dim in dimensions
-        )
-        != num_cores
-    ):
-        return None
-    # Split counts classify the geometry; the actual views are the ownership
-    # contract. Never replace their core order with a reconstructed default.
-    if not _compatible_partitions(source, destination, num_cores):
-        return None
-    geometry = tuple(
-        RelayoutDimension(
-            device_dim=dim,
-            source_split=source_splits.get(dim, 1),
-            destination_split=destination_splits.get(dim, 1),
-            group_count=destination_splits.get(dim, 1),
-            group_size=(source_splits.get(dim, 1) // destination_splits.get(dim, 1)),
-            multiplicity=(source_splits.get(dim, 1) // destination_splits.get(dim, 1)),
-            # The views carry the physical core order.  This label records only
-            # the certified equal-sized grouping, not a second owner mapping.
-            ordering_tag="uniform_groups",
-        )
-        for dim in dimensions
-    )
-    return source, destination, geometry
-
-
-def _grouped_broadcast_geometry(
-    source: PerCoreView,
-    destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int,
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    """Classify a complete source partition spread over more physical cores."""
-
-    source_splits = dict(source.work_slice_dims)
-    destination_splits = dict(destination.work_slice_dims)
-    if (
-        source_num_cores >= destination_num_cores
-        or math.prod(source_splits.values()) != source_num_cores
-        or destination_num_cores % math.prod(destination_splits.values())
-    ):
-        return None
-
-    dimensions = tuple(dict.fromkeys((*source_splits, *destination_splits)))
-    for dim in dimensions:
-        source_split = source_splits.get(dim, 1)
-        destination_split = destination_splits.get(dim, 1)
-        if destination_split < source_split or destination_split % source_split:
-            return None
-    # Split counts classify the geometry; the actual views are the ownership
-    # contract. Never replace their core order with a reconstructed default.
-    if not _compatible_partitions(
-        source,
-        destination,
-        source_num_cores,
-        destination_num_cores,
-    ):
-        return None
-    geometry = tuple(
-        RelayoutDimension(
-            device_dim=dim,
-            source_split=source_splits.get(dim, 1),
-            destination_split=destination_splits.get(dim, 1),
-            group_count=source_splits.get(dim, 1),
-            group_size=(destination_splits.get(dim, 1) // source_splits.get(dim, 1)),
-            multiplicity=(destination_splits.get(dim, 1) // source_splits.get(dim, 1)),
-            # The views carry the physical core order.  This label records only
-            # the certified equal-sized grouping, not a second owner mapping.
-            ordering_tag="uniform_groups",
-        )
-        for dim in dimensions
-    )
-    return source, destination, geometry
+    rows = owner_slots(dict(view.core_to_slot), dict(view.work_slice_dims), num_cores)
+    return dict(enumerate(rows))
 
 
 def partition_footprint(layout: FixedTiledLayout, view: PerCoreView) -> int:
@@ -408,290 +314,136 @@ def _overlap(a: int, an: int, b: int, bn: int) -> bool:
     return a * bn < (b + 1) * an and b * an < (a + 1) * bn
 
 
-def _transfer_edges(
+def movement_supported(
     source: PerCoreView,
     destination: PerCoreView,
     source_num_cores: int,
     destination_num_cores: int,
-) -> frozenset[tuple[int, int]]:
-    """Derive movement from ownership, independent of collective names.
+) -> bool:
+    """Extend the original full-partition check to gathers and broadcasts.
 
-    An edge ``(s, d)`` exists exactly when source core ``s`` owns tensor
-    elements needed by destination core ``d``. Shuffle, gather, broadcast, and
-    gather-plus-broadcast are certified shapes of this one fact; they must never
-    derive a different movement graph.
+    Edges are ownership intersections, never a separate geometry calculation.
+    A complete source may feed uniformly repeated destination slices. Across
+    unequal core counts, only even broadcasts (one source per destination) are
+    supported. Equal destination slices have identical sources by construction.
     """
 
-    if source.num_cores != source_num_cores:
-        raise ValueError(
-            "source ownership core domain disagrees with the transfer domain"
-        )
-    if destination.num_cores != destination_num_cores:
-        raise ValueError(
-            "destination ownership core domain disagrees with the transfer domain"
-        )
-
-    source_map = _core_slices(source, source_num_cores)
-    destination_map = _core_slices(destination, destination_num_cores)
+    num_cores = source_num_cores
     source_splits = dict(source.work_slice_dims)
     destination_splits = dict(destination.work_slice_dims)
-    dimensions = set(source_splits) | set(destination_splits)
-    return frozenset(
-        (source_core, destination_core)
-        for source_core, source_slice in source_map.items()
-        for destination_core, destination_slice in destination_map.items()
-        if all(
-            _overlap(
-                source_slice.get(dim, 0),
-                source_splits.get(dim, 1),
-                destination_slice.get(dim, 0),
-                destination_splits.get(dim, 1),
-            )
-            for dim in dimensions
-        )
-    )
-
-
-def _compatible_partitions(
-    source: PerCoreView,
-    destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int | None = None,
-) -> bool:
-    """Whether every destination receives a uniform, complete partition."""
-
-    if destination_num_cores is None:
-        destination_num_cores = source_num_cores
+    destination_slices = math.prod(destination_splits.values())
     if (
-        source_num_cores <= 0
-        or destination_num_cores <= 0
-        or source.num_cores != source_num_cores
+        num_cores <= 0
+        or destination_num_cores < num_cores
+        or source.num_cores != num_cores
         or destination.num_cores != destination_num_cores
+        or destination_num_cores % num_cores
+        or math.prod(source_splits.values()) != num_cores
+        or destination_slices <= 0
+        or destination_num_cores % destination_slices
+        or (num_cores == destination_num_cores and source.same_partition(destination))
     ):
         return False
-    source_map = _core_slices(source, source_num_cores)
+    source_map = _core_slices(source, num_cores)
     destination_map = _core_slices(destination, destination_num_cores)
-    source_splits = dict(source.work_slice_dims)
-    destination_splits = dict(destination.work_slice_dims)
     edges = _transfer_edges(
-        source, destination, source_num_cores, destination_num_cores
+        source_splits, destination_splits, source_map, destination_map
     )
-    fanout = [sum(src == core for src, _ in edges) for core in range(source_num_cores)]
+    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
     fanin = [
         sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
     ]
-    if not edges or len(set(fanout)) != 1 or len(set(fanin)) != 1:
-        return False
-    source_owners = len({tuple(sorted(row.items())) for row in source_map.values()})
-    destination_owners = len(
-        {tuple(sorted(row.items())) for row in destination_map.values()}
-    )
-    if (
-        source_owners != source_num_cores
-        or math.prod(source_splits.values()) != source_num_cores
-    ):
-        return False
-    destination_slices = math.prod(destination_splits.values())
-    if (
-        destination_owners != destination_slices
-        or destination_num_cores % destination_slices
-    ):
-        return False
-    if source_num_cores != destination_num_cores:
-        return fanout[0] == destination_num_cores // source_num_cores and fanin[0] == 1
-    multiplicity = source_num_cores // destination_slices
-    return multiplicity == 1 or (fanout[0] == multiplicity and fanin[0] == multiplicity)
-
-
-def _gather_broadcast_geometry(
-    source: PerCoreView,
-    destination: PerCoreView,
-    num_cores: int,
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    """Certify gather followed by broadcast from the complete owner maps."""
-
-    if source.num_cores != num_cores or destination.num_cores != num_cores:
-        return None
-    source_splits = dict(source.work_slice_dims)
-    destination_splits = dict(destination.work_slice_dims)
-    source_map = _core_slices(source, num_cores)
-    destination_map = _core_slices(destination, num_cores)
-    source_owners = {tuple(sorted(row.items())) for row in source_map.values()}
-    destination_owners = {
+    replicas = collections.Counter(
         tuple(sorted(row.items())) for row in destination_map.values()
+    )
+    return bool(edges) and all(
+        (
+            len(set(fanout)) == 1,
+            len(set(fanin)) == 1,
+            len({tuple(sorted(row.items())) for row in source_map.values()})
+            == num_cores,
+            len(replicas) == destination_slices,
+            num_cores != destination_num_cores or len(set(replicas.values())) == 1,
+            num_cores == destination_num_cores
+            or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
+        )
+    )
+
+
+def _transfer_edges(source_splits, destination_splits, source_map, destination_map):
+    """The same ownership intersections serve ordinary and completed-result copies."""
+    return {
+        (s_core, d_core)
+        for s_core, s_slice in source_map.items()
+        for d_core, d_slice in destination_map.items()
+        if all(
+            _overlap(
+                s_slice.get(dim, 0),
+                source_splits.get(dim, 1),
+                d_slice.get(dim, 0),
+                destination_splits.get(dim, 1),
+            )
+            for dim in source_splits.keys() | destination_splits.keys()
+        )
     }
-    destination_slices = math.prod(destination_splits.values())
-    if (
-        math.prod(source_splits.values()) != num_cores
-        or len(source_owners) != num_cores
-        or not 0 < destination_slices <= num_cores
-        or len(destination_owners) != destination_slices
-        or num_cores % destination_slices
-    ):
-        return None
-
-    dimensions = tuple(dict.fromkeys((*source_splits, *destination_splits)))
-    if not any(
-        source_splits.get(dim, 1) > destination_splits.get(dim, 1) for dim in dimensions
-    ):
-        return None
-    edges = _transfer_edges(source, destination, num_cores, num_cores)
-    fanout = [
-        sum(source_core == core for source_core, _ in edges)
-        for core in range(num_cores)
-    ]
-    fanin = [
-        sum(destination_core == core for _, destination_core in edges)
-        for core in range(num_cores)
-    ]
-    if (
-        not edges
-        or 0 in fanout
-        or 0 in fanin
-        or len(set(fanout)) != 1
-        or len(set(fanin)) != 1
-    ):
-        return None
-
-    destination_counts: dict[tuple[tuple[int, int], ...], int] = {}
-    incoming_by_slice: dict[tuple[tuple[int, int], ...], set[int]] = {}
-    for destination_core, destination_slice in destination_map.items():
-        key = tuple(sorted(destination_slice.items()))
-        destination_counts[key] = destination_counts.get(key, 0) + 1
-        incoming = {
-            source_core
-            for source_core, edge_destination in edges
-            if edge_destination == destination_core
-        }
-        previous = incoming_by_slice.setdefault(key, incoming)
-        if previous != incoming:
-            return None
-
-    receivers_per_slice = num_cores // destination_slices
-    # One receiver per slice is the foundational shuffle. This certifier covers
-    # only the case where each completed slice is broadcast to several cores.
-    if receivers_per_slice <= 1:
-        return None
-    if set(destination_counts.values()) != {receivers_per_slice}:
-        return None
-    geometry = tuple(
-        RelayoutDimension(
-            device_dim=dim,
-            source_split=source_splits.get(dim, 1),
-            destination_split=destination_splits.get(dim, 1),
-            group_count=destination_slices,
-            group_size=fanin[0],
-            multiplicity=receivers_per_slice,
-            ordering_tag="view_pair",
-        )
-        for dim in dimensions
-        if source_splits.get(dim, 1) != destination_splits.get(dim, 1)
-    )
-    return source, destination, geometry
 
 
-def _shuffle_geometry(
+def derive_completed_reduction_routes(
     source: PerCoreView,
     destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int,
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    """Certify #3439's cross-core shuffle ownership pattern.
+    reduction_split: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Read only the last slice's completed value; the backend already sums it.
 
-    Each core starts with one unique source slice and ends with one unique
-    destination slice.  When the two partitions cut different axes, cores
-    exchange the pieces required by the destination partition. Ragged payload
-    sizes may differ, but the ownership-level class remains a shuffle.
+    The terminal is the last core of each contiguous K-fast group even when
+    OUT is split. Earlier cores never write their result buffers. Full-domain
+    broadcasts retain the existing K2/K3/K4 contract; the smaller-domain
+    one-to-one extension is limited to the device-checked K2/K4 writer rule.
     """
-
-    if source_num_cores != destination_num_cores or source.same_partition(destination):
-        return None
-    if not _compatible_partitions(
-        source, destination, source_num_cores, destination_num_cores
-    ):
-        return None
-    return source, destination, ()
-
-
-def _gather_geometry(
-    source: PerCoreView,
-    destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int,
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    """Give gather the common classifier signature."""
-
-    if source_num_cores != destination_num_cores:
-        return None
-    return _grouped_gather_geometry(source, destination, source_num_cores)
-
-
-def _gather_broadcast_geometry_adapter(
-    source: PerCoreView,
-    destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int,
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    """Give gather-plus-broadcast the common classifier signature."""
-
-    if source_num_cores != destination_num_cores:
-        return None
-    return _gather_broadcast_geometry(source, destination, source_num_cores)
-
-
-def _broadcast_geometry(
-    source: PerCoreView,
-    destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int,
-) -> tuple[PerCoreView, PerCoreView, tuple[RelayoutDimension, ...]] | None:
-    return _grouped_broadcast_geometry(
-        source, destination, source_num_cores, destination_num_cores
-    )
-
-
-# Ownership determines movement through ``_transfer_edges``.  These existing
-# lowerings are only certificates that the backend can emit that movement.
-_LOWERING_CERTIFIERS = {
-    "broadcast": _broadcast_geometry,
-    "gather": _gather_geometry,
-    "gather_broadcast": _gather_broadcast_geometry_adapter,
-    "shuffle": _shuffle_geometry,
-}
-# More than one certifier may recognize a future transfer.  This order chooses
-# one stable lowering only after every surviving fast path agrees on the edges.
-_LOWERING_PRIORITY = ("broadcast", "gather_broadcast", "gather", "shuffle")
-
-
-def classify_relayout_views(
-    source: PerCoreView,
-    destination: PerCoreView,
-    source_num_cores: int,
-    destination_num_cores: int | None = None,
-    *,
-    allowed_kinds: Sequence[str] | None = None,
-) -> tuple[str, tuple[RelayoutDimension, ...]] | None:
-    """Choose the first certified lowering for an ownership-derived move."""
-
-    if destination_num_cores is None:
-        destination_num_cores = source_num_cores
+    source_count, destination_count = source.num_cores, destination.num_cores
+    splits, target = dict(source.work_slice_dims), dict(destination.work_slice_dims)
+    owners = math.prod(splits.values())
     if (
-        source_num_cores <= 0
-        or destination_num_cores <= 0
-        or source.num_cores != source_num_cores
-        or destination.num_cores != destination_num_cores
-    ):
-        return None
-    allowed = set(allowed_kinds) if allowed_kinds is not None else None
-    for kind in _LOWERING_PRIORITY:
-        if allowed is not None and kind not in allowed:
-            continue
-        classified = _LOWERING_CERTIFIERS[kind](
-            source, destination, source_num_cores, destination_num_cores
+        source_count is None
+        or destination_count is None
+        or reduction_split not in (2, 3, 4)
+        or owners * reduction_split != source_count
+        or math.prod(target.values()) != destination_count
+        or not (
+            destination_count == source_count
+            or (destination_count == owners and reduction_split in (2, 4))
         )
-        if classified is not None:
-            return kind, classified[2]
-    return None
+        or any(
+            target.get(d, 1) % splits.get(d, 1) for d in splits.keys() | target.keys()
+        )
+    ):
+        raise ValueError("unsupported completed-reduction ownership geometry")
+    source_map = _core_slices(source, source_count)
+    target_map = _core_slices(destination, destination_count)
+    groups: dict[tuple, list[int]] = {}
+    for core, row in source_map.items():
+        groups.setdefault(tuple(sorted(row.items())), []).append(core)
+    if len(
+        {tuple(sorted(row.items())) for row in target_map.values()}
+    ) != destination_count or any(
+        group != list(range(group[0], group[0] + reduction_split))
+        for group in groups.values()
+    ):
+        raise ValueError(
+            "completed-reduction owners require contiguous source groups and distinct destinations"
+        )
+    terminals = {group[-1] for group in groups.values()}
+    edges = _transfer_edges(splits, target, source_map, target_map)
+    routes: dict[int, list[int]] = {core: [] for core in sorted(terminals)}
+    for destination_core in range(destination_count):
+        writers = [s for s, d in edges if d == destination_core and s in terminals]
+        if len(writers) != 1:
+            raise ValueError("each destination must read exactly one completed result")
+        routes[writers[0]].append(destination_core)
+    counts = {len(consumers) for consumers in routes.values()}
+    if 0 in counts or len(counts) != 1:
+        raise ValueError("completed-reduction routes require uniform fanout")
+    return tuple((core, tuple(consumers)) for core, consumers in routes.items())
 
 
 def _single_write(op: ComputedBuffer, name: str) -> MemoryDep | None:
@@ -717,13 +469,6 @@ def _is_activation_source(
     )
 
 
-def _supports_cross_domain_broadcast(consumer: ComputedBuffer) -> bool:
-    return _is_matmul_op(consumer) or (
-        config.lx_pointwise_broadcast_relayout
-        and isinstance(consumer.data, Pointwise)
-    )
-
-
 def _unsupported_relayout_transition_reason(
     source_work_division: TensorWorkDivision,
     destination_work_division: TensorWorkDivision,
@@ -746,34 +491,6 @@ def _unsupported_relayout_transition_reason(
     return None
 
 
-def _destination_plan_key(
-    existing: Mapping[tuple, Sequence[str]],
-    destination_view: PerCoreView,
-    kind: str,
-    geometry: tuple[RelayoutDimension, ...],
-    source_footprint: int,
-    destination_footprint: int,
-) -> tuple:
-    """Reuse a destination whose owner formulas mean the same thing.
-
-    SymPy can spell the same mapping differently, for example ``core_id`` and
-    ``Mod(core_id, 4)`` over four cores.  Structural dictionary equality would
-    materialize two copies for those equivalent views and waste LX capacity.
-    """
-
-    key = (
-        destination_view,
-        kind,
-        geometry,
-        source_footprint,
-        destination_footprint,
-    )
-    for candidate in existing:
-        if candidate[1:] == key[1:] and candidate[0].same_partition(destination_view):
-            return candidate
-    return key
-
-
 def collect_lx_relayout_plans(
     graph: GraphLowering,
     *,
@@ -781,6 +498,13 @@ def collect_lx_relayout_plans(
     ownership_overrides: Mapping[str, TensorWorkDivision] | None = None,
     unprojectable_sources: list[str] | None = None,
 ) -> list[LXRelayoutPlan]:
+    """Certify movement under committed or proposed operation ownership.
+
+    Overrides apply to both writes and reads, including their physical core
+    domains and reduction splits. This lets selection price a whole proposal
+    without committing any operation or changing the graph.
+    """
+
     if not config.lx_planner_relayout or config.ktir_emitter:
         return []
     if materialized_lx_relayouts(graph):
@@ -805,19 +529,38 @@ def collect_lx_relayout_plans(
             or (write := _single_write(producer, source_name)) is None
         ):
             continue
+        source_ownership = (ownership_overrides or {}).get(source_name)
         source_view, partial, representable = _per_core_view_on_buf(
             producer,
             write,
             source_name,
             cache,
-            ownership_override=(ownership_overrides or {}).get(source_name),
+            ownership_override=source_ownership,
         )
-        source_num_cores = _op_num_cores(producer)
+        source_num_cores = (
+            source_ownership.physical_core_count
+            if source_ownership is not None
+            else _op_num_cores(producer)
+        )
+        reduction = (
+            completed_reduction_split_on_buf(
+                producer, write, source_name, ownership_override=source_ownership
+            )
+            if partial
+            else None
+        )
         if (
             source_view is None
-            or partial
             or not representable
             or source_view.num_cores != source_num_cores
+            or (
+                partial
+                and (
+                    reduction is None
+                    or source_num_cores != config.sencores
+                    or not config.core_id_k_fast_emission
+                )
+            )
         ):
             continue
 
@@ -843,11 +586,12 @@ def collect_lx_relayout_plans(
                 producer_coordinates,
                 iteration_space_from_op(producer),
             )
-        except ValueError:
+        except ValueError as exc:
             logger.debug(
                 "rejected LX relayout candidate source=%s: "
-                "cannot represent: source ownership cannot be projected to producer",
+                "cannot represent: source ownership cannot be projected to producer: %s",
                 source_name,
+                exc,
             )
             continue
 
@@ -879,31 +623,37 @@ def collect_lx_relayout_plans(
             if any(d.is_indirect() for d in deps):
                 rejection_reason = "cannot emit: consumer uses indirect access"
                 break
+            consumer_ownership = (ownership_overrides or {}).get(consumer_name)
             view, consumer_partial, representable = _per_core_view_on_buf(
-                consumer, dep, source_name, cache
+                consumer,
+                dep,
+                source_name,
+                cache,
+                ownership_override=consumer_ownership,
             )
-            consumer_num_cores = _op_num_cores(consumer)
+            consumer_num_cores = (
+                consumer_ownership.physical_core_count
+                if consumer_ownership is not None
+                else _op_num_cores(consumer)
+            )
             if view is None or consumer_partial or not representable:
                 rejection_reason = (
                     "cannot represent: consumer ownership is partial or unrepresentable"
                 )
                 break
-            if consumer_num_cores < source_num_cores:
+            if consumer_num_cores < source_num_cores and reduction is None:
                 rejection_reason = (
                     "cannot emit: consumer uses fewer physical cores than producer"
                 )
                 break
-            if consumer_num_cores > source_num_cores and not (
-                _supports_cross_domain_broadcast(consumer)
-            ):
+            if consumer_num_cores > source_num_cores and not _is_matmul_op(consumer):
                 rejection_reason = (
-                    "cannot emit: grouped broadcast requires a supported consumer"
+                    "cannot emit: grouped broadcast requires a matmul consumer"
                 )
                 break
             if (
                 consumer_num_cores > source_num_cores
                 and consumer_num_cores != config.sencores
-                and not config.lx_pointwise_broadcast_relayout
             ):
                 rejection_reason = (
                     "cannot emit: grouped broadcast must target all compute cores"
@@ -918,7 +668,7 @@ def collect_lx_relayout_plans(
                 )
                 break
             consumer_space = iteration_space_from_op(consumer)
-            if view.same_partition(source_view):
+            if reduction is None and view.same_partition(source_view):
                 continue
             is_matmul = _is_matmul_op(consumer)
             if is_matmul and len(deps) != 2:
@@ -933,55 +683,51 @@ def collect_lx_relayout_plans(
                 break
 
             destination_owners = math.prod(dict(view.work_slice_dims).values())
-            allowed_kinds: Sequence[str]
             if consumer_num_cores > source_num_cores:
-                allowed_kinds = ("broadcast",)
                 failure = (
                     "cannot emit: grouped destination does not evenly "
                     "broadcast the source"
                 )
-            elif destination_owners < source_num_cores:
+            elif reduction is None and destination_owners < source_num_cores:
                 if not is_matmul:
                     rejection_reason = (
                         "cannot emit: grouped gather requires a matmul consumer"
                     )
                     break
-                allowed_kinds = ("gather", "gather_broadcast")
                 failure = (
                     "cannot emit: grouped destination does not evenly contract "
                     "the source"
                 )
             else:
-                allowed_kinds = ("gather_broadcast", "shuffle")
                 failure = "cannot emit: unsupported ownership transfer"
 
             try:
-                classified = classify_relayout_views(
-                    source_view,
-                    view,
-                    source_num_cores,
-                    consumer_num_cores,
-                    allowed_kinds=allowed_kinds,
+                routes = (
+                    derive_completed_reduction_routes(source_view, view, reduction)
+                    if reduction is not None
+                    else ()
+                )
+                supported = (
+                    bool(routes)
+                    if reduction is not None
+                    else movement_supported(
+                        source_view, view, source_num_cores, consumer_num_cores
+                    )
                 )
             except (TypeError, ValueError) as exc:
                 rejection_reason = (
                     f"cannot represent: invalid ownership partition: {exc}"
                 )
                 break
-            if classified is None:
+            if not supported:
                 rejection_reason = failure
                 break
             transfers.append(
-                (
-                    consumer_name,
-                    consumer_coordinates,
-                    consumer_space,
-                    view,
-                    *classified,
-                )
+                (consumer_name, consumer_coordinates, consumer_space, view, routes)
             )
 
-        plans_by_destination: dict[tuple, list[str]] = {}
+        # Reuse the ownership comparison and preserve first-consumer order.
+        destinations: list[tuple[PerCoreView, int, tuple, list[str]]] = []
         if rejection_reason is None:
             try:
                 source_footprint = partition_footprint(producer.layout, source_view)
@@ -994,8 +740,7 @@ def collect_lx_relayout_plans(
                 consumer_coordinates,
                 consumer_space,
                 destination_view,
-                kind,
-                geometry,
+                routes,
             ) in transfers:
                 try:
                     source_work_division = work_division_from_view(
@@ -1004,10 +749,10 @@ def collect_lx_relayout_plans(
                         consumer_coordinates,
                         consumer_space,
                     )
-                except ValueError:
+                except ValueError as exc:
                     rejection_reason = (
                         "cannot represent: source ownership cannot be projected "
-                        "to consumer"
+                        f"to consumer: {exc}"
                     )
                     source_unprojectable_to_consumer = True
                     break
@@ -1022,10 +767,10 @@ def collect_lx_relayout_plans(
                         consumer_coordinates,
                         consumer_space,
                     )
-                except ValueError:
+                except ValueError as exc:
                     rejection_reason = (
                         "cannot represent: destination ownership cannot be projected "
-                        "to consumer"
+                        f"to consumer: {exc}"
                     )
                     break
                 if destination_work_division is None:
@@ -1046,15 +791,23 @@ def collect_lx_relayout_plans(
                         f"allocation: destination footprint is unavailable: {exc}"
                     )
                     break
-                key = _destination_plan_key(
-                    plans_by_destination,
-                    destination_view,
-                    kind,
-                    geometry,
-                    source_footprint,
-                    destination_footprint,
-                )
-                plans_by_destination.setdefault(key, []).append(consumer_name)
+                for group_view, footprint, group_routes, consumers in destinations:
+                    if (
+                        footprint == destination_footprint
+                        and group_routes == routes
+                        and group_view.same_partition(destination_view)
+                    ):
+                        consumers.append(consumer_name)
+                        break
+                else:
+                    destinations.append(
+                        (
+                            destination_view,
+                            destination_footprint,
+                            routes,
+                            [consumer_name],
+                        )
+                    )
 
         if rejection_reason is None:
             result.extend(
@@ -1064,18 +817,16 @@ def collect_lx_relayout_plans(
                     source_view=source_view,
                     destination_view=destination_view,
                     num_cores=source_num_cores,
-                    kind=kind,
-                    group_geometry=geometry,
                     source_footprint_bytes=source_footprint,
                     destination_footprint_bytes=destination_footprint,
+                    producer_consumers=routes,
                 )
                 for (
                     destination_view,
-                    kind,
-                    geometry,
-                    source_footprint,
                     destination_footprint,
-                ), consumer_names in plans_by_destination.items()
+                    routes,
+                    consumer_names,
+                ) in destinations
             )
         if rejection_reason is not None:
             if unprojectable_sources is not None and source_unprojectable_to_consumer:
@@ -1095,13 +846,12 @@ def anchor_lx_relayout_ownership(graph: GraphLowering) -> None:
     Work-division split counts are already final here. This pass only changes
     their canonical owner order, and only when the ordinary relayout planner
     proves one unique order makes the complete source group expressible. The
-    allocator later records the accepted physical view; the post-scheduler gate
-    only preflights that same committed view through codegen's finalizer.
+    allocator records the accepted physical view; kernel preparation consumes
+    it without choosing another owner order.
     """
 
     if (
-        not config.lx_consumer_anchored_ordering
-        or not config.lx_planner_relayout
+        not config.lx_planner_relayout
         or config.co_optimizing_lx_planning
         or config.ktir_emitter
     ):
@@ -1116,28 +866,28 @@ def anchor_lx_relayout_ownership(graph: GraphLowering) -> None:
         producer: ComputedBuffer,
         candidate: TensorWorkDivision,
     ) -> bool:
-        writes = [
-            dep
-            for dep in op_read_writes(producer).writes
-            if isinstance(dep, MemoryDep) and dep.name == source_name
-        ]
-        reads = [
+        """Whether every reader already agrees with ``candidate`` without movement.
+
+        This is the direct path, not a zero-transfer planner result: it has
+        fewer reader restrictions than movement planning and accepts on plain
+        partition agreement.
+        """
+
+        write = _single_write(producer, source_name)
+        readers = [
             (consumer, dep)
             for consumer in graph.operations
             for dep in op_read_writes(consumer).reads
             if isinstance(dep, MemoryDep) and dep.name == source_name
         ]
-        if len(writes) != 1 or not reads:
+        if write is None or not readers:
             return False
         source_view, partial, representable = _per_core_view_on_buf(
-            producer,
-            writes[0],
-            source_name,
-            ownership_override=candidate,
+            producer, write, source_name, ownership_override=candidate
         )
         if partial or not representable:
             return False
-        for consumer, dep in reads:
+        for consumer, dep in readers:
             view, consumer_partial, consumer_representable = _per_core_view_on_buf(
                 consumer, dep, source_name
             )
@@ -1147,14 +897,9 @@ def anchor_lx_relayout_ownership(graph: GraphLowering) -> None:
                 or not view.same_partition(source_view)
             ):
                 logger.debug(
-                    "direct LX owner mismatch source=%s consumer=%s source_view=%s "
-                    "consumer_view=%s partial=%s representable=%s",
+                    "direct LX owner mismatch source=%s consumer=%s",
                     source_name,
                     consumer.get_name(),
-                    source_view,
-                    view,
-                    consumer_partial,
-                    consumer_representable,
                 )
                 return False
         return True
@@ -1255,14 +1000,11 @@ def materialize_lx_relayouts(graph: GraphLowering, plans: list[LXRelayoutPlan]) 
         copy_layout.allocation["lx"] = plan.destination_address
         copy_layout.lx_view = plan.destination_view
         logger.debug(
-            "accepted LX relayout %s -> %s: "
-            "source=%s@%d destination=%s@%d kind=%s geometry=%s",
+            "accepted LX relayout %s -> %s: source=%s@%d destination=%s@%d",
             source.get_name(),
             copy.get_name(),
             plan.source_view,
             plan.source_address,
             plan.destination_view,
             plan.destination_address,
-            plan.kind,
-            plan.group_geometry,
         )

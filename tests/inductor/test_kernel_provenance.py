@@ -81,6 +81,7 @@ def _op(
     tiled_symbol_trip_counts=None,
     symbolic_dim_bounds=None,
     node_output_ranges=None,
+    producer_consumers=(),
 ) -> OpSpec:
     return OpSpec(
         op=op,
@@ -96,6 +97,7 @@ def _op(
             {} if symbolic_dim_bounds is None else symbolic_dim_bounds
         ),
         node_output_ranges=node_output_ranges,
+        producer_consumers=producer_consumers,
         debug_handle=handle,
     )
 
@@ -135,6 +137,21 @@ def _generated_wrapper_roundtrip(specs):
 
 
 class TestKernelProvenanceDescriptor:
+    def test_completed_reduction_route_changes_bundle_identity(self):
+        ordinary = build_kernel_provenance_descriptor([_op(None)])
+        routed = build_kernel_provenance_descriptor(
+            [_op(None, producer_consumers=((3, (0, 1, 2, 3)),))]
+        )
+
+        assert ordinary.key != routed.key
+
+    def test_completed_reduction_route_survives_generated_wrapper(self):
+        routes = ((3, (0, 1, 2, 3)), (7, (4, 5, 6, 7)))
+
+        (result,) = _generated_wrapper_roundtrip([_op(None, producer_consumers=routes)])
+
+        assert result.producer_consumers == routes
+
     def test_builds_bundle_identity_without_handles(self):
         specs = [
             _op(None),
@@ -670,13 +687,14 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner(
                 "sdsc_fused_mm_0",
                 "/tmp/kernel",
                 kernel_provenance=descriptor,
             )
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is descriptor
         assert runner.profiler_event_name == _event_name(descriptor)
         assert runner.jobplan == "jobplan"
@@ -697,9 +715,10 @@ class TestKernelProvenancePropagation:
                 "torch_spyre.execution.kernel_runner.prepare_kernel",
                 return_value="jobplan",
             ) as prepare_kernel,
+            patch("torch_spyre.execution.kernel_runner.torch.spyre._impl._lazy_init"),
         ):
             runner = SpyreSDSCKernelRunner("sdsc_fused_mm_0", "/tmp/kernel")
-
+            assert runner.jobplan == "jobplan"
         assert runner.kernel_provenance is None
         assert runner.profiler_event_name is None
         prepare_kernel.assert_called_once_with("/tmp/kernel/spyreCodeDir")

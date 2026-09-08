@@ -12,17 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
-import dataclasses
+from functools import partial
 import math
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import sympy
-from lx_finalizer_parity import _normalize_call
 
 import torch_spyre._inductor.codegen.superdsc as superdsc_module
+import torch_spyre._inductor.core_mapping as core_mapping_module
 import torch_spyre._inductor.pass_utils as pass_utils_module
 import torch_spyre._inductor.spyre_kernel as spyre_kernel_module
 from torch_spyre._C import DataFormats, ElementArrangement
@@ -37,52 +36,41 @@ from torch_spyre._inductor.core_mapping import (
     derive_core_mapping,
     derive_partition_mapping,
     derive_operation_mapping,
-    finalize_core_mapping_pure,
     finalize_tensor_work_divisions,
-    partition_physical_span_bytes,
-    remap_work_division,
-    select_partition_division_matching_physical_ownership,
     select_unique_partition_division,
-    work_division_matches_physical_ownership,
 )
 from torch_spyre._inductor.op_spec import (
     OpSpec,
     TensorArg,
     TensorWorkDivision,
     LX_RELAYOUT_INFO_KEY,
-    is_lx_relayout_identity,
 )
 from torch_spyre._inductor.pass_utils import PerCoreView, per_core_views_equal
 from torch_spyre._inductor.spyre_kernel import simplify_op_spec
 from torch_spyre._inductor.views import (
     align_tensors,
-    align_tensors_pure,
-    build_alignment_inputs,
+)
+
+
+_CORE_ID = sympy.Symbol("core_id")
+_FUSED = sympy.Symbol("fused")
+
+# Literal defaults only: each case supplies its coordinates, strides and owners.
+_view_prep = partial(
+    pass_utils_module._ViewPrep,
+    elems_per_stick=64,
+    stick_host_stride=None,
+    num_stick_dim=None,
+    num_stick=0,
+    num_stick_stride=0,
+    is_matmul=False,
 )
 
 
 def _coordinates(splits, num_cores, **kwargs):
     dims = sympy.symbols(f"dim_0:{len(splits)}")
     mapping = core_to_slice_mapping(dims, splits, num_cores, **kwargs)
-    core_id = sympy.Symbol("core_id")
-    return [
-        tuple(int(mapping[dim].subs(core_id, core)) for dim in dims)
-        for core in range(num_cores)
-    ]
-
-
-def test_lx_finalizer_audit_keeps_graph_node_identities_alive(lx_finalizer_parity):
-    def node():
-        operation = SimpleNamespace(get_operation_name=lambda: "pointwise")
-        return SimpleNamespace(node=operation, get_name=lambda: "op0")
-
-    first, second = node(), node()
-    first_identity = lx_finalizer_parity._identity(first)
-    second_identity = lx_finalizer_parity._identity(second)
-
-    assert first_identity != second_identity
-    assert lx_finalizer_parity._node_refs[id(first)] is first
-    assert lx_finalizer_parity._node_refs[id(second)] is second
+    return _mapping_coordinates(mapping, dims, num_cores)
 
 
 def test_default_mapping_preserves_existing_core_order():
@@ -104,49 +92,17 @@ def test_owner_slots_must_be_concrete_integers(slot):
         _core_slices(view, 2)
 
 
-def test_codegen_rejects_lx_allocation_without_physical_ownership():
+def test_kernel_rejects_lx_allocation_without_physical_ownership():
+    """The fault is a placement rejection: preparation demotes and retries."""
+
     kernel = spyre_kernel_module.SpyreKernel.__new__(spyre_kernel_module.SpyreKernel)
     kernel.current_node = SimpleNamespace(node=object())
     tensor = SimpleNamespace(layout=SimpleNamespace(allocation={"lx": 0}, lx_view=None))
     with (
         mock.patch.object(spyre_kernel_module, "iteration_space", return_value={}),
-        pytest.raises(
-            RuntimeError,
-            match="missing_view reached codegen without physical ownership",
-        ),
+        pytest.raises(ValueError, match="missing_view has no physical ownership"),
     ):
         kernel.create_tensor_arg(False, "missing_view", tensor)
-
-
-@pytest.mark.parametrize("elems_per_stick", [32, 64, 128])
-def test_partition_span_includes_padding_between_rows(elems_per_stick):
-    assert (
-        partition_physical_span_bytes(
-            device_size=(8, 4, elems_per_stick),
-            elems_per_stick=elems_per_stick,
-            split_by_device_dim={0: 4, 1: 2},
-        )
-        == 768
-    )
-
-
-@pytest.mark.parametrize(
-    "device_size,eps,splits,reason",
-    [
-        ((), 64, {}, "extents"),
-        ((0, 64), 64, {}, "extents"),
-        ((-1, 64), 64, {}, "extents"),
-        ((8, 64), 0, {}, "elems_per_stick"),
-        ((8, 64), 64, {0: 0}, "invalid split"),
-        ((8, 64), 64, {-1: 2}, "invalid split"),
-        ((8, 64), 64, {2: 2}, "invalid split"),
-        ((8, 32), 64, {}, "complete final stick"),
-        ((8, 64), 64, {1: 2}, "cannot be split"),
-    ],
-)
-def test_partition_span_rejects_unsupported_geometry(device_size, eps, splits, reason):
-    with pytest.raises(ValueError, match=reason):
-        partition_physical_span_bytes(device_size, eps, splits)
 
 
 @pytest.mark.parametrize("contiguous_dim", [0, 1, 2])
@@ -214,29 +170,20 @@ def test_late_mapping_derives_contiguous_broadcast_groups():
     assert coordinates == [(core % 16, core // 16) for core in range(32)]
 
 
-def test_exact_physical_owners_select_one_canonical_dimension_order():
-    batch, kv = sympy.symbols("batch kv")
-    core_id = sympy.Symbol("core_id")
-
-    selected = select_partition_division_matching_physical_ownership(
-        (batch, kv),
-        {batch: 4, kv: 8},
-        {batch: 4, kv: 8},
-        (4, 8),
-        (batch, kv),
-        ((0, 4), (1, 8)),
-        ((0, sympy.floor(core_id / 8)), (1, sympy.Mod(core_id, 8))),
-        32,
-    )
-
-    assert selected is not None
-    assert [
-        (
-            int(selected.core_id_to_work_slice[batch].subs(core_id, core)),
-            int(selected.core_id_to_work_slice[kv].subs(core_id, core)),
+def test_ambiguous_canonical_owner_orders_are_rejected():
+    first, second = sympy.symbols("first second")
+    reasons = []
+    assert (
+        select_unique_partition_division(
+            (first, second),
+            {first: 2, second: 2},
+            4,
+            lambda _: True,
+            rejection_reasons=reasons,
         )
-        for core in range(32)
-    ] == [(core // 8, core % 8) for core in range(32)]
+        is None
+    )
+    assert reasons == ["ambiguous ownership: multiple canonical maps matched"]
 
 
 def test_late_partition_mapping_repeats_contiguous_owners():
@@ -247,95 +194,81 @@ def test_late_partition_mapping_repeats_contiguous_owners():
     ]
 
 
-def test_partition_selection_rejects_ambiguous_owner_orders():
-    first, second = sympy.symbols("first second")
-
-    assert (
-        select_unique_partition_division(
-            (first, second),
-            {first: 2, second: 2},
-            4,
-            lambda _candidate: True,
-        )
-        is None
-    )
-
-
-def _canonical_division(extents, splits, num_cores):
-    dims = tuple(extents)
-    mapping = derive_partition_mapping(
-        dims,
-        tuple(splits[dim] for dim in dims),
-        num_cores,
-    )
-    return TensorWorkDivision(dict(splits), mapping, num_cores=num_cores)
-
-
-def test_exact_fused_axis_projection_rejects_disjoint_2_by_2_regions():
-    fused = sympy.Symbol("fused")
-    division = _canonical_division({fused: 32}, {fused: 4}, 4)
-    core_id = sympy.Symbol("core_id")
-
-    assert not work_division_matches_physical_ownership(
+@pytest.mark.parametrize(
+    ("extent", "split", "device_size", "accepted", "owner"),
+    [
+        # A 98-wide axis must not lose f = 98 to floating-point rounding.
+        (784, 16, (8, 98), ((0, 8), (1, 2)), lambda c: (c // 2, c % 2)),
+        # The fused budget counts states: 1020 + 4 fits, 1024 + 4 does not.
+        (1020, 4, (4, 255), ((0, 4),), lambda c: (c,)),
+        (1024, 4, (4, 256), None, None),
+    ],
+)
+def test_fused_decomposition_is_exact_and_bounded(
+    extent, split, device_size, accepted, owner
+):
+    division = TensorWorkDivision({_FUSED: split}, {_FUSED: _CORE_ID}, num_cores=split)
+    reasons = []
+    result = core_mapping_module.decompose_fused_split_view(
+        _FUSED,
+        split,
+        _CORE_ID,
         division,
-        {fused: 32},
-        (4, 8),
-        (sympy.floor(fused / 8), sympy.Mod(fused, 8)),
-        ((0, 2), (1, 2)),
-        ((0, sympy.floor(core_id / 2)), (1, sympy.Mod(core_id, 2))),
-        4,
+        {_FUSED: extent},
+        device_size,
+        (sympy.floor(_FUSED / device_size[1]), sympy.Mod(_FUSED, device_size[1])),
+        split,
+        rejection_reasons=reasons,
     )
-
-
-def test_exact_fused_axis_projection_checks_every_loop_value():
-    fused, feature = sympy.symbols("fused feature")
-    core_id = sympy.Symbol("core_id")
-    division = TensorWorkDivision(
-        {fused: 4, feature: 2},
-        {fused: sympy.Mod(core_id, 4), feature: sympy.floor(core_id / 4)},
-        num_cores=8,
-    )
-
-    assert not work_division_matches_physical_ownership(
-        division,
-        {fused: 4, feature: 8},
-        (4, 8),
-        (fused, sympy.Mod(feature + 4 * sympy.Mod(feature, 4), 8)),
-        ((0, 4), (1, 2)),
-        ((0, sympy.Mod(core_id, 4)), (1, sympy.floor(core_id / 4))),
-        8,
-    )
+    if accepted is None:
+        assert result is None
+        assert reasons == [
+            f"proof limit: fused decomposition needs {extent + split} states; "
+            "limit is 1024"
+        ]
+        return
+    assert result is not None and result[0] == accepted
+    assert [
+        tuple(int(slot.subs(_CORE_ID, c)) for _, slot in result[1])
+        for c in range(split)
+    ] == [owner(c) for c in range(split)]
 
 
 @pytest.mark.parametrize(
-    "extent, split, matches",
-    [(129, 3, True), (130, 3, True), (192, 3, True), (129, 2, False), (100, 3, False)],
+    ("coords", "extent", "split", "sizes"),
+    [
+        ((_FUSED, _FUSED), 4, 2, (4, 4)),
+        ((3 - _FUSED,), 4, 2, (4,)),
+        ((sympy.floor((_FUSED + 1) / 4),), 6, 2, (2,)),
+        ((2 * _FUSED,), 4, 2, (8,)),
+        ((sympy.Mod(_FUSED + 6, 8),), 4, 2, (8,)),
+        ((sympy.floor(_FUSED / 98), sympy.Mod(_FUSED, 98)), 196, 2, (2, 98)),
+    ],
 )
-def test_exact_projection_proves_stick_axis_loops_in_whole_sticks(
-    extent, split, matches
-):
-    """The inverse proof uses the same whole-stick model as the view builder.
-
-    A loop over the stickified host axis selects a stick and a position within
-    it. Three sticks split three ways give one stick per core whatever the
-    logical tail; two cores cannot own three sticks evenly.
-    """
-    x = sympy.Symbol("x")
-    core_id = sympy.Symbol("core_id")
-    division = TensorWorkDivision({x: split}, {x: core_id}, num_cores=split)
-
-    assert (
-        work_division_matches_physical_ownership(
-            division,
-            {x: extent},
-            (3, 64),
-            (sympy.floor(x / 64), sympy.Mod(x, 64)),
-            ((0, split),),
-            ((0, sympy.Mod(core_id, split)),),
-            split,
-        )
-        is matches
+def test_index_regions_match_exact_points(coords, extent, split, sizes):
+    coordinates = tuple(
+        c.xreplace({_FUSED: core_mapping_module._LOOP_POINT}) for c in coords
     )
+    bounds, full = [], True
+    width = extent // split
+    for part in range(split):
+        points = {
+            tuple(c.subs(_FUSED, p) for c in coords)
+            for p in range(part * width, (part + 1) * width)
+        }
+        region = tuple(zip(map(min, zip(*points)), map(max, zip(*points))))
+        bounds.append(region)
+        full &= len(points) == width == math.prod(hi - lo + 1 for lo, hi in region)
+    for rectangles in (False, True):
+        if rectangles and not full:
+            with pytest.raises(ValueError):
+                core_mapping_module._loop_regions(
+                    extent, coordinates, sizes, split, True
+                )
+        else:
+            assert core_mapping_module._loop_regions(
+                extent, coordinates, sizes, split, rectangles
+            ) == tuple(bounds)
 
 
 def test_late_mapping_keeps_shared_destination_after_one_consumer_factors():
@@ -375,217 +308,33 @@ def test_group_topology_does_not_follow_final_loop_reordering():
     )
 
 
-def test_tensor_work_division_compares_physical_owners_not_sympy_spelling():
-    head = sympy.Symbol("head")
-    core_id = sympy.Symbol("core_id")
-    left = TensorWorkDivision(
-        {head: 4},
-        {head: sympy.Mod(core_id, 4)},
-        num_cores=8,
-    )
-    right = TensorWorkDivision(
-        {head: 4},
-        {head: core_id - 4 * sympy.floor(core_id / 4)},
-        num_cores=8,
-    )
+def test_owner_maps_compare_physical_owners_not_sympy_spelling():
+    """Equivalent spellings compare equal; unsplit dimensions describe nothing."""
 
-    assert left != right
-    assert left.same_ownership(right)
-
-
-def test_tensor_work_division_rejects_different_core_order():
-    head = sympy.Symbol("head")
-    core_id = sympy.Symbol("core_id")
-    left = TensorWorkDivision(
-        {head: 4},
-        {head: sympy.Mod(core_id, 4)},
-        num_cores=8,
-    )
-    right = TensorWorkDivision(
-        {head: 4},
-        {head: sympy.floor(core_id / 2)},
-        num_cores=8,
-    )
-
-    assert not left.same_ownership(right)
-
-
-def test_tensor_work_division_ignores_unsplit_dimensions_and_infers_core_count():
     head, local = sympy.symbols("head local")
-    core_id = sympy.Symbol("core_id")
+    same = _CORE_ID - 4 * sympy.floor(_CORE_ID / 4)
+    reordered = sympy.floor(_CORE_ID / 2)
     left = TensorWorkDivision(
-        {head: 4, local: 1},
-        {head: sympy.Mod(core_id, 4), local: sympy.Integer(0)},
+        {head: 4, local: 1}, {head: sympy.Mod(_CORE_ID, 4), local: sympy.S.Zero}
     )
-    right = TensorWorkDivision(
-        {head: 4},
-        {head: sympy.Mod(core_id, 4)},
-        num_cores=4,
-    )
+    equivalent = TensorWorkDivision({head: 4}, {head: same}, num_cores=4)
 
     assert left.physical_core_count == 4
-    assert left.same_ownership(right)
-
-
-def test_per_core_view_compares_physical_owners_not_sympy_spelling():
-    core_id = sympy.Symbol("core_id")
-    left = PerCoreView(
-        ((0, 4),),
-        ((0, sympy.Mod(core_id, 4)),),
-        num_cores=8,
-    )
-    right = PerCoreView(
-        ((0, 4), (1, 1)),
-        (
-            (0, core_id - 4 * sympy.floor(core_id / 4)),
-            (1, sympy.Integer(0)),
-        ),
-        num_cores=8,
-    )
-    reordered = PerCoreView(
-        ((0, 4),),
-        ((0, sympy.floor(core_id / 2)),),
-        num_cores=8,
+    assert left != equivalent and left.same_ownership(equivalent)
+    assert not left.same_ownership(
+        TensorWorkDivision({head: 4}, {head: reordered}, num_cores=4)
     )
 
-    assert left != right
-    assert left.same_partition(right)
-    assert per_core_views_equal(left, right)
-    assert not left.same_partition(reordered)
+    view = PerCoreView(((0, 4),), ((0, sympy.Mod(_CORE_ID, 4)),), num_cores=8)
+    equivalent_view = PerCoreView(
+        ((0, 4), (1, 1)), ((0, same), (1, sympy.S.Zero)), num_cores=8
+    )
+    assert view != equivalent_view and view.same_partition(equivalent_view)
+    assert per_core_views_equal(view, equivalent_view)
     assert per_core_views_equal(None, None)
-
-
-def test_remap_work_division_accepts_equivalent_merged_owner_slots():
-    first, second, merged = sympy.symbols("first second merged")
-    core_id = sympy.Symbol("core_id")
-    division = TensorWorkDivision(
-        {first: 4, second: 4},
-        {
-            first: sympy.Mod(core_id, 4),
-            second: core_id - 4 * sympy.floor(core_id / 4),
-        },
-        num_cores=8,
+    assert not view.same_partition(
+        PerCoreView(((0, 4),), ((0, reordered),), num_cores=8)
     )
-
-    remapped = remap_work_division(
-        division,
-        {first: ((merged, 4),), second: ((merged, 4),)},
-    )
-
-    assert remapped.physical_core_count == 8
-    assert remapped.work_slices == {merged: 4}
-    assert core_mappings_equal(
-        {merged: remapped.core_id_to_work_slice[merged]},
-        {merged: sympy.Mod(core_id, 4)},
-        8,
-    )
-
-
-def test_remap_work_division_rejects_conflicting_merged_owner_slots():
-    first, second, merged = sympy.symbols("first second merged")
-    core_id = sympy.Symbol("core_id")
-    division = TensorWorkDivision(
-        {first: 4, second: 4},
-        {
-            first: sympy.Mod(core_id, 4),
-            second: sympy.floor(core_id / 2),
-        },
-        num_cores=8,
-    )
-
-    with pytest.raises(ValueError, match="conflicting normalized ownership"):
-        remap_work_division(
-            division,
-            {first: ((merged, 4),), second: ((merged, 4),)},
-        )
-
-
-def test_remap_work_division_reports_missing_alignment():
-    old, other = sympy.symbols("old other")
-    division = TensorWorkDivision(
-        {old: 2},
-        {old: sympy.Mod(sympy.Symbol("core_id"), 2)},
-        num_cores=2,
-    )
-
-    with pytest.raises(ValueError, match="old has no alignment"):
-        remap_work_division(division, {other: ((other, 2),)})
-
-
-def test_commit_tensor_work_division_completes_unsplit_loops(monkeypatch):
-    split, local = sympy.symbols("split local")
-    core_id = sympy.Symbol("core_id")
-    op = SimpleNamespace()
-    monkeypatch.setattr(
-        pass_utils_module,
-        "iteration_space_from_op",
-        lambda _: {split: sympy.Integer(8), local: sympy.Integer(64)},
-    )
-
-    pass_utils_module.commit_tensor_work_division(
-        op,
-        TensorWorkDivision(
-            {split: 4},
-            {split: sympy.Mod(core_id, 4)},
-            num_cores=8,
-        ),
-    )
-
-    assert op.iteration_space_ownership == TensorWorkDivision(
-        {split: 4, local: 1},
-        {split: sympy.Mod(core_id, 4), local: sympy.S.Zero},
-        num_cores=8,
-    )
-
-
-def test_certified_identity_fails_if_equivalent_owner_spellings_collapse():
-    head = sympy.Symbol("head")
-    core_id = sympy.Symbol("core_id")
-    base = TensorArg(
-        True,
-        0,
-        DataFormats.SEN169_FP16,
-        [4, 64],
-        [head, head],
-        {"lx": 0},
-        work_division=TensorWorkDivision(
-            {head: 4},
-            {head: sympy.Mod(core_id, 4)},
-            num_cores=4,
-        ),
-    )
-    destination = dataclasses.replace(
-        base,
-        is_input=False,
-        work_division=TensorWorkDivision(
-            {head: 4},
-            {head: core_id - 4 * sympy.floor(core_id / 4)},
-            num_cores=4,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="ownership collapsed"):
-        is_lx_relayout_identity(
-            "identity", (base, destination), {LX_RELAYOUT_INFO_KEY: "shuffle"}
-        )
-    different_destination = dataclasses.replace(
-        destination,
-        work_division=TensorWorkDivision(
-            {head: 4},
-            {head: sympy.floor(core_id / 2)},
-            num_cores=4,
-        ),
-    )
-    assert not is_lx_relayout_identity("identity", (base, different_destination), {})
-    assert is_lx_relayout_identity(
-        "identity",
-        (base, different_destination),
-        {LX_RELAYOUT_INFO_KEY: "shuffle"},
-    )
-    with pytest.raises(ValueError, match="registered plan kind"):
-        is_lx_relayout_identity(
-            "identity", (base, different_destination), {LX_RELAYOUT_INFO_KEY: True}
-        )
 
 
 def test_late_mapping_rejects_geometry_that_does_not_fill_groups():
@@ -597,28 +346,6 @@ def test_late_mapping_rejects_geometry_that_does_not_fill_groups():
             32,
             grouped_splits={h: 2},
         )
-
-
-def test_final_tensor_ownership_preserves_committed_core_order():
-    extra, shared = sympy.symbols("extra shared")
-    core_id = sympy.Symbol("core_id")
-    division = TensorWorkDivision(
-        {shared: 2},
-        # Planning-time placement is working data, not the final assignment.
-        {shared: sympy.Mod(core_id, 2)},
-        num_cores=4,
-    )
-
-    (finalized,) = finalize_tensor_work_divisions(
-        {extra: (8, 2), shared: (8, 2)},
-        [division],
-    )
-
-    assert finalized == TensorWorkDivision(
-        {shared: 2},
-        {shared: sympy.Mod(core_id, 2)},
-        num_cores=4,
-    )
 
 
 def test_shared_lx_buffer_keeps_owners_across_different_operation_dims():
@@ -668,25 +395,6 @@ def test_shared_lx_buffer_keeps_owners_across_different_operation_dims():
     )
 
 
-def test_final_tensor_ownership_makes_the_inferred_core_domain_explicit():
-    shared = sympy.Symbol("shared")
-    core_id = sympy.Symbol("core_id")
-
-    (finalized,) = finalize_tensor_work_divisions(
-        {shared: (8, 2)},
-        [
-            TensorWorkDivision(
-                {shared: 2},
-                {shared: sympy.Mod(core_id, 2)},
-            )
-        ],
-    )
-
-    assert finalized is not None
-    assert finalized.num_cores == 2
-    assert finalized.core_id_to_work_slice == {shared: sympy.Mod(core_id, 2)}
-
-
 def test_operation_mapping_preserves_a_satisfying_default_map():
     batch, head = sympy.symbols("batch head")
     core_id = sympy.Symbol("core_id")
@@ -724,28 +432,6 @@ def test_operation_mapping_rejects_conflicting_lx_tensor_owners():
         )
 
 
-def test_operation_mapping_bounds_aligned_owner_dimension_permutations():
-    dims = sympy.symbols("d0:6")
-    core_id = sympy.Symbol("core_id")
-    division = TensorWorkDivision(
-        {dim: 2 for dim in dims},
-        {
-            dim: sympy.Mod(sympy.floor(core_id / (2 ** (len(dims) - index - 1))), 2)
-            for index, dim in enumerate(dims)
-        },
-        num_cores=64,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="too many aligned tensor-owned dimensions.*6 > 5",
-    ):
-        derive_operation_mapping(
-            {dim: (sympy.Integer(2), 2) for dim in dims},
-            [division],
-        )
-
-
 def test_scalar_op_has_a_complete_empty_mapping():
     op_spec = OpSpec("identity", False, {}, [], {})
     simplify_op_spec(op_spec)
@@ -774,273 +460,71 @@ def test_alignment_preview_is_repeatable_and_does_not_consume_repeat_info():
     assert preview == codegen
 
 
-def test_captured_alignment_inputs_leave_codegen_unchanged(monkeypatch):
-    dim = sympy.Symbol("dim")
-    op_spec = OpSpec(
-        "identity",
-        False,
-        {dim: (sympy.Integer(4), 2)},
-        [
-            TensorArg(
-                True,
-                0,
-                DataFormats.SEN169_FP16,
-                [2, 64],
-                [sympy.floor(dim / 2), dim],
-                {"hbm": 0},
-            )
-        ],
-        {},
-    )
-    monkeypatch.setattr(
-        pass_utils_module,
-        "alignment_coordinates",
-        lambda *args, **kwargs: [sympy.floor(dim / 2), dim],
-    )
-    captured = pass_utils_module.build_operation_alignment_inputs(
-        {dim: sympy.Integer(4)},
-        [pass_utils_module.AlignmentAccess(SimpleNamespace(device_size=[2, 64]), dim)],
-        indirect_sizes={sympy.Symbol("unused_prior_index"): 67},
-        aligned_iteration_space=op_spec.iteration_space,
-    )
-    assert captured.indirect_sizes == {}
-    # A preceding validation preview must neither consume nor change the input
-    # subsequently used by codegen.
-    align_tensors_pure(captured)
+def _lx_op_spec(op, iteration_space, tensors, divisions, *, certified=False):
+    """An operation on LX-resident operands, before alignment.
 
-    captured_path = copy.deepcopy(op_spec)
-    ordinary_path = copy.deepcopy(op_spec)
-    simplify_op_spec(captured_path, alignment_inputs=captured)
-    simplify_op_spec(ordinary_path)
-
-    assert captured_path == ordinary_path
-
-
-@pytest.mark.parametrize("is_relayout", [False, True])
-def test_preflight_and_codegen_finalize_from_identical_inputs(is_relayout):
-    """The recoverable preflight and codegen must run the same finalization.
-
-    This is the permanent caller-boundary proof: preflight asks the shared input
-    builder to attach the operation's committed splits, while codegen supplies
-    that already-finalized split space. Neither caller may add another ownership
-    derivation.
+    ``certified`` marks it as a planner-certified relayout identity.
     """
 
-    row, column, element = sympy.symbols("row column element")
-    raw_iteration_space = {
-        row: sympy.Integer(4),
-        column: sympy.Integer(4),
-        element: sympy.Integer(64),
-    }
-    index = 256 * row + 64 * column + element
-    read = pass_utils_module.MemoryDep(
-        "source",
-        index,
-        tuple(raw_iteration_space),
-        tuple(raw_iteration_space.values()),
-    )
-    write = pass_utils_module.MemoryDep(
-        "destination",
-        index,
-        tuple(raw_iteration_space),
-        tuple(raw_iteration_space.values()),
-    )
-    read_writes = SimpleNamespace(reads={read}, writes={write})
-    op = SimpleNamespace(
-        op_it_space_splits=({sympy.Integer(256): 2, sympy.Integer(64): 2}, {}),
-        get_name=lambda: "alignment_contract",
-    )
-    device_layout = pass_utils_module.SpyreTensorLayout(
-        [4, 4, 64],
-        [256, 64, 1],
-        DataFormats.SEN169_FP16,
-        ElementArrangement.STANDARD,
-    )
-    accesses = [
-        pass_utils_module.AlignmentAccess(device_layout, read.index),
-        pass_utils_module.AlignmentAccess(device_layout, write.index),
+    args = [
+        TensorArg(
+            index + 1 < len(tensors),
+            index,
+            DataFormats.SEN169_FP16,
+            list(tensor["size"]),
+            list(tensor["coordinates"]),
+            {"lx": 0},
+            work_division=division,
+        )
+        for index, (tensor, division) in enumerate(zip(tensors, divisions))
     ]
-    aligned_iteration_space = pass_utils_module.iteration_space_with_splits(
-        op, read_writes, raw_iteration_space
-    )
-    preflight_inputs = pass_utils_module.build_operation_alignment_inputs(
-        raw_iteration_space,
-        accesses,
-        indirect_sizes={},
-        op=op,
-        read_writes=read_writes,
-    )
-    codegen_inputs = pass_utils_module.build_operation_alignment_inputs(
-        raw_iteration_space,
-        accesses,
-        indirect_sizes={},
-        aligned_iteration_space=aligned_iteration_space,
-    )
-
-    assert preflight_inputs == codegen_inputs
-
-    source_mapping = core_to_slice_mapping((row, column), (2, 2), 4)
-    destination_mapping = core_to_slice_mapping((column, row), (2, 2), 4)
-    source_division = TensorWorkDivision(
-        {row: 2, column: 2},
-        source_mapping,
-        num_cores=4,
-    )
-    destination_division = TensorWorkDivision(
-        {row: 2, column: 2},
-        destination_mapping,
-        num_cores=4,
-    )
-    divisions = (
-        (source_division, destination_division)
-        if is_relayout
-        else (destination_division, destination_division)
-    )
-    kwargs = {
-        "is_matmul": False,
-        "core_id_k_fast": False,
-        "is_relayout": is_relayout,
-    }
-
-    assert finalize_core_mapping_pure(
-        preflight_inputs, divisions, **kwargs
-    ) == finalize_core_mapping_pure(codegen_inputs, divisions, **kwargs)
-    if is_relayout:
-        with pytest.raises(ValueError, match="ownership collapse after alignment"):
-            finalize_core_mapping_pure(
-                preflight_inputs,
-                (destination_division, destination_division),
-                **kwargs,
-            )
+    op_info = {LX_RELAYOUT_INFO_KEY: True} if certified else {}
+    return OpSpec(op, False, dict(iteration_space), args, op_info)
 
 
-def test_finalizer_treats_repeated_identical_constraints_idempotently():
-    """ReadWrites may collapse ``x + x`` while codegen keeps both operands."""
+def test_relayouts_are_finished_on_the_operation_split_space():
+    """Ownership is settled on the operation's committed split space.
 
-    row, column = sympy.symbols("row column")
-    iteration_space = {
-        row: (sympy.Integer(4), 2),
-        column: (sympy.Integer(4), 2),
-    }
-    tensor = {"size": [4, 4, 64], "coordinates": [row, column, sympy.S.Zero]}
-    output = {"size": [4, 4, 64], "coordinates": [row, column, sympy.S.Zero]}
-    one_read = build_alignment_inputs(iteration_space, [tensor, output])
-    repeated_read = build_alignment_inputs(iteration_space, [tensor, tensor, output])
-    mapping = core_to_slice_mapping((row, column), (2, 2), 4)
-    division = TensorWorkDivision(
-        {row: 2, column: 2},
-        mapping,
-        num_cores=4,
-    )
-    equivalent = TensorWorkDivision(
-        division.work_slices,
-        {
-            dim: sympy.Mod(expression + 2, 2, evaluate=False)
-            for dim, expression in mapping.items()
-        },
-        num_cores=4,
-    )
-    kwargs = {
-        "is_matmul": False,
-        "core_id_k_fast": False,
-        "is_relayout": False,
-    }
-
-    unique_result = finalize_core_mapping_pure(
-        one_read,
-        (division, division),
-        **kwargs,
-    )
-    repeated_result = finalize_core_mapping_pure(
-        repeated_read,
-        (division, equivalent, division),
-        **kwargs,
-    )
-
-    assert unique_result[0] == repeated_result[0]
-    assert unique_result[3:] == repeated_result[3:]
-    assert repeated_result[1][0] == repeated_result[1][1] == unique_result[1][0]
-    assert repeated_result[2][0].same_ownership(repeated_result[2][1])
-    assert repeated_result[2][0].same_ownership(unique_result[2][0])
-    assert _normalize_call(one_read, (division, division), kwargs) == _normalize_call(
-        repeated_read, (division, equivalent, division), kwargs
-    )
-    unsplit = sympy.Symbol("unsplit")
-    explicit_unsplit = TensorWorkDivision(
-        {**division.work_slices, unsplit: 1},
-        {**mapping, unsplit: sympy.S.Zero},
-        num_cores=4,
-    )
-    assert _normalize_call(one_read, (division, division), kwargs) == _normalize_call(
-        one_read, (explicit_unsplit, division), kwargs
-    )
-
-
-def test_relayout_supports_distinct_physical_core_domains():
-    """A two-core source can broadcast into a 32-core destination view."""
+    An ordinary operation keeps its owners; a certified relayout keeps the
+    destination's owners, also across core domains; coinciding divisions,
+    domains that do not divide the execution domain and splits beyond the
+    aligned extent are rejected.
+    """
 
     head = sympy.Symbol("head")
-    core_id = sympy.Symbol("core_id")
-    inputs = build_alignment_inputs(
-        {head: (sympy.Integer(2), 2)},
-        [
-            {"size": [2, 64], "coordinates": [head, sympy.S.Zero]},
-            {"size": [2, 64], "coordinates": [head, sympy.S.Zero]},
-        ],
-    )
-    source = TensorWorkDivision(
-        {head: 2},
-        {head: sympy.Mod(core_id, 2)},
-        num_cores=2,
-    )
-    destination = TensorWorkDivision(
-        {head: 2},
-        {head: sympy.floor(core_id / 16)},
-        num_cores=32,
-    )
+    space = {head: (sympy.Integer(2), 2)}
+    tensor = {"size": [2, 64], "coordinates": [head, sympy.S.Zero]}
 
-    aligned_space, _, _, mapping, _ = finalize_core_mapping_pure(
-        inputs,
-        (source, destination),
-        is_matmul=False,
-        core_id_k_fast=False,
-        is_relayout=True,
-    )
+    def division(split, slot, num_cores):
+        return TensorWorkDivision({head: split}, {head: slot}, num_cores=num_cores)
 
-    assert set(mapping) == set(aligned_space) == {head}
+    source = division(2, sympy.Mod(_CORE_ID, 2), 2)
+    wide = division(2, sympy.floor(_CORE_ID / 16), 32)
+
+    ordinary = _lx_op_spec("add", space, [tensor, tensor], (source, source))
+    simplify_op_spec(ordinary)
     assert core_mappings_equal(
-        {head: mapping[head]},
-        {head: sympy.floor(core_id / 16)},
-        32,
+        {head: ordinary.core_id_to_work_slice[head]}, source.core_id_to_work_slice, 2
     )
 
-    invalid_source = TensorWorkDivision(
-        {head: 3},
-        {head: sympy.Mod(core_id, 3)},
-        num_cores=3,
+    def finish(source, destination):
+        op_spec = _lx_op_spec(
+            "identity", space, [tensor, tensor], (source, destination), certified=True
+        )
+        simplify_op_spec(op_spec)
+        return op_spec
+
+    relayout = finish(source, wide)
+    assert set(relayout.core_id_to_work_slice) == set(relayout.iteration_space)
+    assert core_mappings_equal(
+        relayout.core_id_to_work_slice, wide.core_id_to_work_slice, 32
     )
+    with pytest.raises(ValueError, match="ownership collapsed"):
+        finish(source, division(2, _CORE_ID - 2 * sympy.floor(_CORE_ID / 2), 2))
     with pytest.raises(ValueError, match="core domains must divide"):
-        finalize_core_mapping_pure(
-            inputs,
-            (invalid_source, destination),
-            is_matmul=False,
-            core_id_k_fast=False,
-            is_relayout=True,
-        )
-
-    mismatched_destination = TensorWorkDivision(
-        {head: 4},
-        {head: sympy.Mod(core_id, 4)},
-        num_cores=32,
-    )
+        finish(division(3, sympy.Mod(_CORE_ID, 3), 3), wide)
     with pytest.raises(ValueError, match="split exceeds its aligned extent"):
-        finalize_core_mapping_pure(
-            inputs,
-            (source, mismatched_destination),
-            is_matmul=False,
-            core_id_k_fast=False,
-            is_relayout=True,
-        )
+        finish(source, division(4, sympy.Mod(_CORE_ID, 4), 32))
 
 
 def _bmm_op_spec(op: str) -> OpSpec:
@@ -1117,20 +601,14 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     op_spec = _bmm_op_spec(op)
     dims = tuple(op_spec.iteration_space)
     splits = dict(zip(dims, (2, 4, 4)))
-    prep = pass_utils_module._ViewPrep(
+    prep = _view_prep(
         iter_space=op_spec.iteration_space,
         write_index=dims[0],
-        read_index=dims[-1],
         dep_coeff={dims[0]: 1, dims[1]: 2, dims[2]: 0},
         dep_device_coordinates=(dims[0], dims[1]),
         device_size=[2, 4],
         stride_map=[1, 2],
-        elems_per_stick=64,
         device_stride_to_dim={1: 0, 2: 1},
-        stick_host_stride=None,
-        num_stick_dim=None,
-        num_stick=0,
-        num_stick_stride=0,
         is_matmul=pass_utils_module._is_matmul_op(FakeComputedBuffer(op)),
     )
     planner_view, _, representable = pass_utils_module._per_core_view_from_prep(
@@ -1150,51 +628,11 @@ def test_planner_and_sdsc_use_the_same_mapping(monkeypatch, op, reduction_contig
     assert dict(planner_view.core_to_slot) == sdsc_output_mapping
 
 
-def test_planner_view_uses_committed_owner_order():
-    kv, batch = sympy.symbols("kv batch")
-    core_id = sympy.Symbol("core_id")
-    prep = pass_utils_module._ViewPrep(
-        iter_space={kv: 8, batch: 4},
-        write_index=8 * batch + kv,
-        read_index=8 * batch + kv,
-        dep_coeff={kv: 1, batch: 8},
-        dep_device_coordinates=(batch, kv),
-        device_size=[4, 8],
-        stride_map=[8, 1],
-        elems_per_stick=1,
-        device_stride_to_dim={8: 0, 1: 1},
-        stick_host_stride=None,
-        num_stick_dim=None,
-        num_stick=0,
-        num_stick_stride=0,
-        is_matmul=False,
-    )
-    ownership = TensorWorkDivision(
-        {kv: 8, batch: 4},
-        {kv: sympy.Mod(core_id, 8), batch: sympy.floor(core_id / 8)},
-        num_cores=32,
-    )
-
-    view, partial, representable = pass_utils_module._per_core_view_from_prep(
-        prep,
-        ownership.work_slices,
-        ownership=ownership,
-    )
-
-    assert representable
-    assert not partial
-    assert dict(view.core_to_slot) == {
-        0: sympy.floor(core_id / 8),
-        1: sympy.Mod(core_id, 8),
-    }
-
-
 def test_flattened_iteration_span_is_not_a_single_axis_view():
     heads, flat = sympy.symbols("heads flat")
-    prep = pass_utils_module._ViewPrep(
+    prep = _view_prep(
         iter_space={heads: 16, flat: 512},
         write_index=512 * heads + flat,
-        read_index=512 * heads + flat,
         dep_coeff={heads: 512, flat: 1},
         dep_device_coordinates=(
             sympy.floor(flat / 256),
@@ -1207,13 +645,11 @@ def test_flattened_iteration_span_is_not_a_single_axis_view():
         ),
         device_size=[2, 1, 1, 1, 4, 16, 64],
         stride_map=[256, -1, -1, -1, 64, 512, 1],
-        elems_per_stick=64,
         device_stride_to_dim={256: 0, 64: 4, 512: 5, 1: 6},
         stick_host_stride=1,
         num_stick_dim=4,
         num_stick=4,
         num_stick_stride=64,
-        is_matmul=False,
     )
 
     view, partial, representable = pass_utils_module._per_core_view_from_prep(
@@ -1245,21 +681,18 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
         device_size, stride_map = [2, 64], [64, 1]
         stick_host_stride, num_stick_dim, num_stick = 1, 0, 2
     owner = split - 1 - core if reverse else core
-    prep = pass_utils_module._ViewPrep(
+    prep = _view_prep(
         iter_space={flat: extent},
         write_index=flat,
-        read_index=flat,
         dep_coeff={flat: 1},
         dep_device_coordinates=coordinates,
         device_size=device_size,
         stride_map=stride_map,
-        elems_per_stick=64,
         device_stride_to_dim={stride: axis for axis, stride in enumerate(stride_map)},
         stick_host_stride=stick_host_stride,
         num_stick_dim=num_stick_dim,
         num_stick=num_stick,
         num_stick_stride=64 if num_stick else 0,
-        is_matmul=False,
     )
     view, partial, representable = pass_utils_module._per_core_view_from_prep(
         prep,
@@ -1294,72 +727,24 @@ def test_stride_selected_compound_view_matches_actual_owned_values(reverse, capt
         assert actual == expected, (c, actual, expected)
 
 
-@pytest.mark.parametrize(
-    "extent, split, representable",
-    [(129, 3, True), (192, 3, True), (129, 2, False), (100, 3, False)],
-)
-def test_stick_axis_split_is_proved_in_whole_sticks(extent, split, representable):
-    """A loop over the stickified axis owns whole sticks, padding included.
-
-    129 fp16 values occupy three sticks of 64 slots. The exact proof must
-    partition those three sticks, not 43 host elements at a time; a
-    43-element piece crosses a stick boundary and would reject a layout the
-    device expresses exactly. Two cores cannot own three sticks evenly, and a
-    loop that stops short of the last stick keeps the element model.
-    """
-    flat = sympy.Symbol("flat", integer=True, nonnegative=True)
-    core = sympy.Symbol("core_id")
-    coordinates = (sympy.floor(flat / 64), sympy.Mod(flat, 64))
-    prep = pass_utils_module._ViewPrep(
-        iter_space={flat: extent},
-        write_index=flat,
-        read_index=flat,
-        dep_coeff={flat: 1},
-        dep_device_coordinates=coordinates,
-        device_size=[3, 64],
-        stride_map=[64, 1],
-        elems_per_stick=64,
-        device_stride_to_dim={64: 0, 1: 1},
-        stick_host_stride=1,
-        num_stick_dim=0,
-        num_stick=3,
-        num_stick_stride=64,
-        is_matmul=False,
-    )
-    view, partial, is_representable = pass_utils_module._per_core_view_from_prep(
-        prep,
-        {flat: split},
-        ownership=TensorWorkDivision({flat: split}, {flat: core}, num_cores=split),
-    )
-    assert not partial
-    assert is_representable == representable
-    if not representable:
-        return
-    assert dict(view.work_slice_dims) == {0: split}
-    slot = dict(view.core_to_slot)[0]
-    assert [int(slot.subs(core, c)) for c in range(split)] == list(range(split))
-
-
 def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
     fused = sympy.Symbol("fused")
-    prep = pass_utils_module._ViewPrep(
+    prep = _view_prep(
         iter_space={fused: 32},
         write_index=fused,
-        read_index=fused,
         dep_coeff={fused: 1},
-        dep_device_coordinates=(sympy.floor(fused / 8), sympy.Mod(fused, 8)),
-        device_size=[4, 8],
-        stride_map=[-1, -1],
-        elems_per_stick=64,
+        dep_device_coordinates=(
+            sympy.floor(fused / 8),
+            sympy.Mod(fused, 8),
+            sympy.S.Zero,
+        ),
+        device_size=[4, 8, 1],
+        stride_map=[-1, -1, 1],
         device_stride_to_dim={},
-        stick_host_stride=None,
-        num_stick_dim=None,
-        num_stick=0,
-        num_stick_stride=0,
-        is_matmul=False,
+        elems_per_stick=1,
     )
 
-    monkeypatch.setattr(pass_utils_module.config, "lx_fused_split_views", False)
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", False)
     disabled_view, disabled_partial, disabled_representable = (
         pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
     )
@@ -1367,7 +752,7 @@ def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
     assert not disabled_partial
     assert not disabled_view.work_slice_dims
 
-    monkeypatch.setattr(pass_utils_module.config, "lx_fused_split_views", True)
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
     enabled_view, enabled_partial, enabled_representable = (
         pass_utils_module._per_core_view_from_prep(prep, {fused: 32})
     )
@@ -1386,100 +771,72 @@ def test_fused_split_view_is_gated_and_preserves_exact_owner_order(monkeypatch):
     )
 
 
-def test_fused_split_view_accepts_v_complete_owned_tuple(monkeypatch):
+@pytest.mark.parametrize(
+    "feature_owned", [True, False], ids=["v_owned_tuple", "interleaved"]
+)
+def test_fused_split_view_checks_complete_owned_tuple(monkeypatch, feature_owned):
     query, fused, feature = sympy.symbols("query fused feature")
-    core_id = sympy.Symbol("core_id")
-    prep = pass_utils_module._ViewPrep(
-        iter_space={query: 2, fused: 32, feature: 16},
-        write_index=16 * fused + feature,
-        read_index=16 * fused + feature,
-        dep_coeff={query: 0, fused: 16, feature: 1},
-        dep_device_coordinates=(
-            sympy.floor(fused / 8),
-            sympy.Mod(fused, 8),
-            feature,
-        ),
-        device_size=[4, 8, 16],
-        stride_map=[-1, -1, 1],
-        elems_per_stick=1,
-        device_stride_to_dim={1: 2},
-        stick_host_stride=1,
-        num_stick_dim=2,
-        num_stick=16,
-        num_stick_stride=1,
-        is_matmul=True,
-    )
-    ownership = TensorWorkDivision(
-        {query: 2, fused: 8, feature: 2},
-        {
-            query: sympy.Mod(core_id, 2),
-            fused: sympy.Mod(sympy.floor(core_id / 2), 8),
-            feature: sympy.floor(core_id / 16),
-        },
-        num_cores=32,
-    )
-
-    monkeypatch.setattr(pass_utils_module.config, "lx_fused_split_views", True)
-    view, partial, representable = pass_utils_module._per_core_view_from_prep(
-        prep,
-        ownership.work_slices,
-        ownership=ownership,
-    )
-
-    fused_slot = sympy.Mod(sympy.floor(core_id / 2), 8)
-    assert representable
-    assert not partial
-    assert view.same_partition(
-        PerCoreView(
-            ((0, 4), (1, 2), (2, 2)),
-            (
-                (0, sympy.floor(fused_slot / 2)),
-                (1, sympy.Mod(fused_slot, 2)),
-                (2, sympy.floor(core_id / 16)),
-            ),
-            num_cores=32,
+    qsplit = 2 if feature_owned else 4
+    space, sizes = {query: qsplit, fused: 32}, [4, 8]
+    splits = {query: qsplit, fused: 8}
+    slots = {
+        query: sympy.Mod(_CORE_ID, 2) if feature_owned else sympy.floor(_CORE_ID / 8),
+        fused: sympy.Mod(sympy.floor(_CORE_ID / 2), 8)
+        if feature_owned
+        else sympy.Mod(_CORE_ID, 8),
+    }
+    coords = [sympy.floor(fused / 8), sympy.Mod(fused, 8)]
+    kwargs = {}
+    if feature_owned:
+        space[feature], splits[feature], slots[feature] = (
+            16,
+            2,
+            sympy.floor(_CORE_ID / 16),
         )
-    )
-
-
-def test_fused_split_view_rejects_nonowned_axis_interleaving(monkeypatch):
-    query, fused = sympy.symbols("query fused")
-    core_id = sympy.Symbol("core_id")
-    prep = pass_utils_module._ViewPrep(
-        iter_space={query: 4, fused: 32},
-        write_index=fused,
-        read_index=fused,
-        dep_coeff={query: 0, fused: 1},
-        dep_device_coordinates=(sympy.floor(fused / 8), sympy.Mod(fused, 8)),
-        device_size=[4, 8],
-        stride_map=[-1, -1],
-        elems_per_stick=64,
-        device_stride_to_dim={},
-        stick_host_stride=None,
-        num_stick_dim=None,
-        num_stick=0,
-        num_stick_stride=0,
+        sizes.extend((16, 1))
+        coords.extend((feature, sympy.Integer(0)))
+        kwargs = dict(
+            elems_per_stick=1,
+            stick_host_stride=1,
+            num_stick_dim=2,
+            num_stick=16,
+            num_stick_stride=1,
+        )
+    index = 16 * fused + feature if feature_owned else fused
+    prep = _view_prep(
+        iter_space=space,
+        write_index=index,
+        dep_coeff={dim: index.coeff(dim) for dim in space},
+        dep_device_coordinates=tuple(coords),
+        device_size=sizes,
+        stride_map=[-1, -1, 1, 1] if feature_owned else [-1, -1],
+        device_stride_to_dim={1: 2} if feature_owned else {},
         is_matmul=True,
+        **kwargs,
     )
-    ownership = TensorWorkDivision(
-        {query: 4, fused: 8},
-        {
-            query: sympy.floor(core_id / 8),
-            fused: sympy.Mod(core_id, 8),
-        },
-        num_cores=32,
-    )
-
-    monkeypatch.setattr(pass_utils_module.config, "lx_fused_split_views", True)
+    ownership = TensorWorkDivision(splits, slots, num_cores=32)
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
     view, partial, representable = pass_utils_module._per_core_view_from_prep(
         prep,
-        ownership.work_slices,
+        splits,
         ownership=ownership,
     )
-
-    assert not representable
-    assert not partial
-    assert not view.work_slice_dims
+    assert representable == feature_owned and not partial
+    if feature_owned:
+        fslot = sympy.Mod(sympy.floor(_CORE_ID / 2), 8)
+        assert view.same_partition(
+            PerCoreView(
+                ((0, 4), (1, 2), (2, 2)),
+                (
+                    (0, sympy.floor(fslot / 2)),
+                    (1, sympy.Mod(fslot, 2)),
+                    (2, sympy.floor(_CORE_ID / 16)),
+                ),
+                num_cores=32,
+            )
+        )
+    else:
+        assert not view.work_slice_dims
 
 
 def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
@@ -1525,6 +882,39 @@ def _prepare_compound_axis_view(iter_space, index, repeat_info=None):
     return prep, graph
 
 
+@pytest.mark.parametrize("flat_split", [4, 8, 16, 32])
+def test_fused_view_keeps_sticks_whole(monkeypatch, flat_split):
+    head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
+    prep, _ = _prepare_compound_axis_view({head: 16, flat: 512}, 512 * head + flat)
+    splits = {head: 1, flat: flat_split}
+    ownership = TensorWorkDivision(
+        splits,
+        {head: sympy.Integer(0), flat: sympy.Mod(_CORE_ID, flat_split)},
+        flat_split,
+    )
+    monkeypatch.setattr(pass_utils_module.config, "lx_planner_relayout", True)
+    view, partial, representable = pass_utils_module._per_core_view_from_prep(
+        prep, splits, ownership=ownership
+    )
+    # A 512-value row has eight whole sticks, never sixteen half-sticks.
+    assert not partial and representable == (flat_split <= 8)
+    if representable:
+        assert (
+            core_mapping_module.partition_physical_span_bytes(
+                prep.device_size, prep.elems_per_stick, dict(view.work_slice_dims)
+            )
+            > 0
+        )
+
+
+def test_direct_axis_proof_budget_boundary():
+    prove = core_mapping_module.direct_axis_ownership_failure
+    point = core_mapping_module._LOOP_POINT
+    assert prove(65536, 1, point, 65536, 1) is None
+    assert prove(65537, 1, point, 65537, 1).startswith("proof limit:")
+    assert prove(8, 2, sympy.Mod(point, 4), 8, 2).startswith("ownership mismatch:")
+
+
 def test_prepare_per_core_view_does_not_record_repeat_info():
     head, flat = sympy.symbols("head flat", integer=True, nonnegative=True)
     prior = sympy.Symbol("prior")
@@ -1541,7 +931,10 @@ def test_prepare_per_core_view_does_not_record_repeat_info():
     assert graph._repeat_info == before
 
 
-def test_reshape_changes_per_core_ownership_within_one_device_axis():
+@pytest.mark.parametrize("relayout_enabled", [False, True])
+def test_reshape_changes_per_core_ownership_within_one_device_axis(
+    monkeypatch, relayout_enabled
+):
     """A split of an inner term is not a contiguous split of the containing axis.
 
     This is the Gemma 4 decode geometry: the producer splits a flattened
@@ -1549,6 +942,10 @@ def test_reshape_changes_per_core_ownership_within_one_device_axis():
     consumer views that dimension as ``[2, 256]`` and splits the inner 256.
     The latter owns alternating pairs of sticks, not contiguous groups of four.
     """
+    # Turning off movement must not turn off the physical-ownership guard.
+    monkeypatch.setattr(
+        pass_utils_module.config, "lx_planner_relayout", relayout_enabled
+    )
     producer_head, producer_flat = sympy.symbols(
         "producer_head producer_flat", integer=True, nonnegative=True
     )

@@ -85,7 +85,7 @@ from .scratchpad.lx_relayout import anchor_lx_relayout_ownership
 from .fusion import spyre_fuse_nodes
 from .scheduler import (
     build_loop_scheduler_nodes,
-    demote_incoherent_lx_buffers,
+    prepare_spyre_kernels,
     verify_carried_reduction_ownership,
 )
 from .constants import DEVICE_NAME
@@ -284,14 +284,15 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
     """
 
     def __init__(self):
-        # Fusion fixes the final loop coordinates. LX ownership preflight then
-        # dry-runs codegen's real finalization while HBM fallback is still
-        # available. HBM planning claims anything preflight demotes before the
-        # carried-reduction pass checks that its required stages still exist.
+        # Fusion fixes the final loop coordinates. Every bundle's kernel is
+        # then prepared once, with the real finalization, while HBM fallback
+        # is still available. HBM planning claims anything preparation demotes
+        # before the carried-reduction pass checks that its required stages
+        # still exist; emission binds only what pooling decided.
         super().__init__(
             [
                 spyre_fuse_nodes,
-                demote_incoherent_lx_buffers,
+                prepare_spyre_kernels,
                 hbm_pool_planning,
                 verify_carried_reduction_ownership,
             ]
@@ -415,6 +416,8 @@ def _maybe_scratchpad_planning(graph: GraphLowering) -> None:
 
 @_runs(anchor_lx_relayout_ownership)
 def _maybe_anchor_lx_relayout_ownership(graph: GraphLowering) -> None:
+    if not config.lx_planning:
+        return
     anchor_lx_relayout_ownership(graph)
 
 

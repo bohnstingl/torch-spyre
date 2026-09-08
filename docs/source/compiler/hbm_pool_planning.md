@@ -100,7 +100,7 @@ CustomPreSchedulingPasses:
 
 CustomPostFusionPasses:
   spyre_fuse_nodes                     # Determine bundle boundaries
-  demote_incoherent_lx_buffers         # Check final LX ownership; demote on failure
+  prepare_spyre_kernels                # Prepare each bundle's kernel once; demote LX on failure
   hbm_pool_planning                    # Per-bundle HBM pool allocation (this pass)
   verify_carried_reduction_ownership   # Check required carried-reduction stages
 ```

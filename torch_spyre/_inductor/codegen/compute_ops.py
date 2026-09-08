@@ -14,6 +14,7 @@
 
 
 import dataclasses
+from typing import Any
 
 from sympy import Symbol
 
@@ -200,11 +201,38 @@ def num_bytes(df: DataFormats) -> int:
     return BYTES_PER_STICK // num_elems
 
 
-def generate_constant_info(data_format, constants, num_cores):
+def generate_constant_info(
+    data_format: DataFormats,
+    constants: dict[str, Any],
+    num_cores: int,
+) -> dict[str, Any] | str:
+    """Generate constant information for SDSC.
+
+    Args:
+        data_format: The data format for encoding constants
+        constants: Dictionary of constant name to value
+        num_cores: Number of cores
+
+    Returns:
+        Dictionary of constant information for SDSC JSON, or the literal string "{}"
+        for the empty-constants case (required by DeepTools SDSC JSON consumer).
+    """
+    # NOTE: Returns the literal string "{}" for the empty-constants case (not an
+    # empty dict) — required by the DeepTools SDSC JSON consumer which distinguishes
+    # between a missing constantInfo_ field and an empty one.
     if len(constants.keys()) == 0:
         return "{}"
-    constant_info = {}
+
+    constant_info: dict[str, Any] = {}
     for name, value in constants.items():
+        try:
+            encoded_value = encode_constant(value, data_format)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"Cannot encode constant '{name}' with value {value} "
+                f"(type: {type(value).__name__}) to {data_format.name}: {e}"
+            ) from e
+
         ci = {
             "dataFormat_": data_format.name,
             "name_": name,
@@ -215,7 +243,7 @@ def generate_constant_info(data_format, constants, num_cores):
                     {"factor_": 1, "label_": "corelet"},
                     {"factor_": 1, "label_": "time"},
                 ],
-                "data_": {"[0, 0, 0]": [encode_constant(value, data_format)]},
+                "data_": {"[0, 0, 0]": [encoded_value]},
             },
         }
         constant_info[f"{len(constant_info)}"] = ci
@@ -1313,6 +1341,16 @@ def generate_sdsc(
             extra["allocateNode_"] = alloc_node
         return extra
 
+    active_core_ids = (
+        tuple(source for source, _ in sdsc_spec.producer_consumers)
+        if sdsc_spec.producer_consumers
+        else tuple(range(sdsc_spec.num_cores))
+    )
+    consumer_core_ids = tuple(
+        sorted(
+            core for _, consumers in sdsc_spec.producer_consumers for core in consumers
+        )
+    )
     return (
         {
             f"{idx}_{sdsc_spec.opfunc}": {
@@ -1332,8 +1370,8 @@ def generate_sdsc(
                 },
                 "coreFoldProp_": {"factor_": sdsc_spec.num_cores, "label_": "core"},
                 "coreletFoldProp_": {"factor_": 1, "label_": "corelet"},
-                "numCoresUsed_": sdsc_spec.num_cores,
-                "coreIdToDsc_": {str(c): 0 for c in range(sdsc_spec.num_cores)},
+                "numCoresUsed_": len(active_core_ids),
+                "coreIdToDsc_": {str(c): 0 for c in active_core_ids},
                 # The top-level map is the operation schedule. Each shuffle
                 # tensor's physical owners are carried separately on its
                 # allocation coordinates below.
@@ -1343,14 +1381,24 @@ def generate_sdsc(
                 },
                 "coreIdToWkSlice_": core_id_to_wk_slice,
                 "coreIdToDscSchedule": {
-                    str(c): [[-1, 0, 0, 0]] for c in range(sdsc_spec.num_cores)
+                    str(c): [[-1, 0, 0, 0]] for c in active_core_ids
                 },
+                **(
+                    {
+                        "prodConsList": {
+                            str(source): list(consumers)
+                            for source, consumers in sdsc_spec.producer_consumers
+                        }
+                    }
+                    if sdsc_spec.producer_consumers
+                    else {}
+                ),
                 "dscs_": [
                     {
                         sdsc_spec.opfunc: {
-                            "numCoresUsed_": sdsc_spec.num_cores,
+                            "numCoresUsed_": len(active_core_ids),
                             "numCoreletsUsed_": 1,
-                            "coreIdsUsed_": [c for c in range(sdsc_spec.num_cores)],
+                            "coreIdsUsed_": list(active_core_ids),
                             "N_": {
                                 "name_": "n",
                                 **{
@@ -1552,10 +1600,20 @@ def generate_sdsc(
                                             sdsc_spec.opfunc, tensor, i
                                         ),
                                         "coreIdToWkSlice_": (
-                                            tensor.work_division.to_core_slices(
-                                                tensor.work_division.num_cores
-                                                or sdsc_spec.num_cores
-                                            )
+                                            {
+                                                core: slices
+                                                for core, slices in tensor.work_division.to_core_slices(
+                                                    tensor.work_division.num_cores
+                                                    or sdsc_spec.num_cores
+                                                ).items()
+                                                if not sdsc_spec.producer_consumers
+                                                or int(core)
+                                                in (
+                                                    active_core_ids
+                                                    if i == 0
+                                                    else consumer_core_ids
+                                                )
+                                            }
                                             if sdsc_spec.opfunc == "shuffle"
                                             and tensor.work_division is not None
                                             else {}

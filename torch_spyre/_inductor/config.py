@@ -62,8 +62,10 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # A .mlir declaring the target device, passed to the backend compiler.
 ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
 
-# Materialize compatible producer/consumer LX ownership changes as identity copies.
-# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable this optimization.
+# Enable certified LX ownership changes: movement, exact fused-axis views,
+# consumer-compatible producer order, and same-core restickify residency.
+# Set SPYRE_LX_PLANNER_RELAYOUT=0 to disable these optional optimizations, not
+# ownership validation. This does not change the allocator or LX memory budget.
 lx_planner_relayout: bool = _get_env_bool("SPYRE_LX_PLANNER_RELAYOUT", True)
 
 # Experimental: decompose one split fused loop into an exactly equivalent
@@ -217,5 +219,12 @@ native_layout_packer: bool = _get_env_bool("TORCH_SPYRE_NATIVE_PACKER", True)
 
 # When symbolic cost_expr fails, use the fallback cost instead of erroring out
 _cpsat_warn_on_cost_expr: bool = True
+# Enable persistent on-disk caching of compiled Spyre kernels across
+# invocations.
+# Set SPYRE_KERNEL_CACHE=0 to disable.
+# To force recompilation (bypass lookup but still save), use the standard
+# PyTorch flag: TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 / set
+# torch._inductor.config.force_disable_caches = True.
+spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
 install_config_module(sys.modules[__name__])

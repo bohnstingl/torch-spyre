@@ -178,32 +178,16 @@ class TensorWorkDivision:
 
         if not isinstance(other, TensorWorkDivision):
             return False
-        left_splits = {
-            dim: int(split) for dim, split in self.work_slices.items() if int(split) > 1
-        }
-        right_splits = {
-            dim: int(split)
-            for dim, split in other.work_slices.items()
-            if int(split) > 1
-        }
-        if (
-            left_splits != right_splits
-            or self.physical_core_count != other.physical_core_count
-        ):
-            return False
-        if not left_splits:
-            return True
+        from .core_mapping import same_owner_maps
 
-        from .core_mapping import core_mappings_equal
-
-        try:
-            return core_mappings_equal(
-                {dim: self.core_id_to_work_slice[dim] for dim in left_splits},
-                {dim: other.core_id_to_work_slice[dim] for dim in right_splits},
-                self.physical_core_count,
-            )
-        except KeyError:
-            return False
+        return same_owner_maps(
+            self.work_slices,
+            self.core_id_to_work_slice,
+            self.physical_core_count,
+            other.work_slices,
+            other.core_id_to_work_slice,
+            other.physical_core_count,
+        )
 
     def remap_symbols(self, symbol_mapping: dict[Symbol, Symbol]) -> TensorWorkDivision:
         """Return this ownership expressed in remapped loop symbols."""
@@ -302,11 +286,8 @@ def is_lx_relayout_identity(
 ) -> bool:
     """A planner-certified LX identity moving between different owners."""
 
-    if not op_info or LX_RELAYOUT_INFO_KEY not in op_info:
+    if not op_info or not op_info.get(LX_RELAYOUT_INFO_KEY):
         return False
-    kind = op_info[LX_RELAYOUT_INFO_KEY]
-    if not isinstance(kind, str) or not kind:
-        raise ValueError("certified LX relayout must name its registered plan kind")
     if op != IDENTITY_OP or len(args) != 2:
         raise ValueError("certified LX relayout must be a two-argument identity")
     source, destination = args
@@ -382,6 +363,9 @@ class OpSpec:
     # node exposes no data.ranges.
     node_output_ranges: tuple[Expr, ...] | None = None
     debug_handle: DebugHandle | None = None
+    # Final source-core -> destination-core routes for a completed-reduction
+    # LX broadcast. Empty for ordinary operations and all-core relayouts.
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
 
 
 # --- Module-level constant tensor cache --------------------------------------

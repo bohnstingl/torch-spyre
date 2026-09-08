@@ -20,9 +20,8 @@ from typing import Any
 from sympy import Expr, Integer, Symbol
 from torch._inductor.virtualized import V
 
-from torch_spyre._C import DataFormats
+from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
-from torch_spyre._C import ElementArrangement
 from torch_spyre._inductor.constants import (
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
@@ -41,6 +40,7 @@ from torch_spyre._inductor.constants import (
     OUTPUT_DIM_LABELS,
     POOL_DIM_LABELS,
     POOL_OPS,
+    QUANTSCALEPERTOKENFP8_OP,
     RESTICKIFY_OP,
     TOPK_OPS,
     KEEP_BY_INDEX_OP,
@@ -147,6 +147,7 @@ class SDSCSpec:
     input_coord_padding: dict = dataclasses.field(default_factory=dict)
     input_coord_sizes: dict = dataclasses.field(default_factory=dict)
     emit_memorg_padding: bool = False
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...] = ()
 
     def __str__(self) -> str:
         iter_space = ", ".join(f"{k}={v}" for k, v in self.iteration_space.items())
@@ -1538,6 +1539,9 @@ def _create_sdsc_tensors(
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     if _is_pool(op) or _is_conv(op):
         return op
+    # quantscalepertokenfp8 maps directly to deeptools operator (no "nonstick" suffix)
+    if op == QUANTSCALEPERTOKENFP8_OP:
+        return op
     if (
         is_reduction
         and not _is_matmul(op)
@@ -1785,6 +1789,7 @@ def _finalize_tensor_work_divisions(
     core_map: dict[Symbol, Expr],
     num_cores: int,
     is_lx_relayout: bool,
+    producer_consumers: tuple[tuple[int, tuple[int, ...]], ...],
 ) -> None:
     """Give every tensor one effective ownership after SDSC normalization."""
 
@@ -1796,7 +1801,11 @@ def _finalize_tensor_work_divisions(
     assert is_lx_relayout or all(arg.work_division is None for arg in args), (
         "per-tensor ownership is supported only for LX relayout identities"
     )
-    for arg in args:
+    producer_ids = tuple(source for source, _ in producer_consumers)
+    consumer_ids = tuple(
+        sorted(core for _, consumers in producer_consumers for core in consumers)
+    )
+    for index, arg in enumerate(args):
         override = arg.work_division
         # A relayout tensor can override the operation-wide split on selected
         # dimensions; unsplit dimensions inherit one slice owned by core zero.
@@ -1812,12 +1821,21 @@ def _finalize_tensor_work_divisions(
                 num_cores=override.num_cores or num_cores,
             )
         )
+        active_core_ids = (
+            producer_ids
+            if producer_consumers and index == 0
+            else consumer_ids
+            if producer_consumers
+            else None
+        )
         tensor_cores = effective.num_cores or num_cores
         tensor_owners = math.prod(effective.work_slices.values())
         valid = (
             tensor_cores == num_cores == tensor_owners
             if not is_lx_relayout
-            else num_cores % tensor_cores == 0 and tensor_cores % tensor_owners == 0
+            else num_cores % tensor_cores == 0
+            and tensor_cores % tensor_owners == 0
+            and (active_core_ids is None or tensor_owners == len(active_core_ids))
         )
         if not valid:
             raise ValueError(
@@ -1954,7 +1972,11 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     # virtual mb=1 row when the op's tensor has only the stick dim.
     mb_sym: Symbol | None = None
     if (
-        (DtypeOpTable.is_dtype_op(op_spec.op) or op_spec.op == "qfp8ch")
+        (
+            DtypeOpTable.is_dtype_op(op_spec.op)
+            or op_spec.op == "qfp8ch"
+            or op_spec.op == QUANTSCALEPERTOKENFP8_OP
+        )
         and op_spec.op != IDENTITY_OP
         and op_stick_dim is not None
         and all(d is op_stick_dim for d in op_dim_order)
@@ -2295,6 +2317,10 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
                             f"ways; expected work division to block it unless the "
                             f"memory-span limit required the split."
                         )
+    # quantscalepertokenfp8 requires only input tensor (not output) to match DDL template
+    if op_spec.op == QUANTSCALEPERTOKENFP8_OP:
+        num_inputs = 1
+
     # Pool-specific SDSC field values (#3510).  Empty for non-pool ops.
     pool_sdsc_fields = (
         _avgpool_sdsc_fields(sdsc_iteration_space, pool_params_out) if is_pool else {}
@@ -2332,6 +2358,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
         core_id_to_work_slice,
         num_cores,
         is_relayout,
+        op_spec.producer_consumers,
     )
     # Collect index tensor indices for indirect access
     indirect_access_indices = [
@@ -2378,6 +2405,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             coordinate_masking=coordinate_masking,
             symbolic_dims=symbolic_dims,
             indirect_access_indices=indirect_access_indices,
+            producer_consumers=op_spec.producer_consumers,
             debug_handle=op_spec.debug_handle,
             # At most one of these is non-empty for a given op (pool / depthwise
             # / forward-conv are mutually exclusive), so the keys never collide.

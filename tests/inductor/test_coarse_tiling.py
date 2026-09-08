@@ -78,6 +78,7 @@ from torch_spyre._inductor.wsr.coarse_tile import (
     _RetiledBufferInfo,
     _apply_plan,
     _compute_fill_loop_info_planned,
+    _compute_read_copy_strides,
     _consumer_own_dim_symbol,
     _divide_ranges,
     _full_buffer_read_deps,
@@ -5959,9 +5960,6 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         ]
         self.assertEqual(len(copy_bufs), 2)
 
-    @unittest.skip(
-        "non-divisible padding raises Unsupported after row-major fallback removal"
-    )
     def test_offset_read_gets_its_own_copy(self):
         """a+shift(a)-style: two reads of the same buffer with identical
         per-var index coefficients but a different constant offset must
@@ -6032,6 +6030,10 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
             if isinstance(op, ComputedBuffer) and op.get_name() != "tiled_op0"
         ]
         self.assertEqual(len(copy_bufs), 2)
+        self.assertEqual(
+            [list(copy_buf.layout.stride) for copy_buf in copy_bufs],
+            [[Integer(8), Integer(1)], [Integer(8), Integer(1)]],
+        )
 
     def test_disable_flag_skips_everything(self):
         """An empty read_copy_plans dict (the insert_read_copies=False case)
@@ -7985,6 +7987,12 @@ class TestTileHelpers(unittest.TestCase):
             compute_tile_stride([8, 16, 32], [544, 32, 1], [2, 4, 8]), [34, 8, 1]
         )
 
+    def test_compute_read_copy_strides_non_divisible_padded_extent(self):
+        self.assertEqual(
+            _compute_read_copy_strides([32, 640, 128], [81920, 128, 1], [8, 192, 128]),
+            [24576, 128, 1],
+        )
+
     def test_compute_tile_offset_1d(self):
         self.assertEqual(compute_tile_offset(0, [(1, 1)]), 0)
         self.assertEqual(compute_tile_offset(1, [(1, 1)]), 1)
@@ -8074,7 +8082,7 @@ class TestTileHelpers(unittest.TestCase):
 
 class TestCustomPostFusionPassesOrder(unittest.TestCase):
     def test_hbm_pool_planning_runs_after_fusion(self):
-        """Final ownership is checked before HBM placement and stage validation."""
+        """Kernels are prepared before HBM placement and stage validation."""
         from torch_spyre._inductor.passes import CustomPostFusionPasses
 
         pipeline = CustomPostFusionPasses()
@@ -8083,7 +8091,7 @@ class TestCustomPostFusionPassesOrder(unittest.TestCase):
             names,
             [
                 "spyre_fuse_nodes",
-                "demote_incoherent_lx_buffers",
+                "prepare_spyre_kernels",
                 "hbm_pool_planning",
                 "verify_carried_reduction_ownership",
             ],

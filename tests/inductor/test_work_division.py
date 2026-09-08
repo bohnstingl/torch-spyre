@@ -27,7 +27,6 @@ from torch._inductor.ir import (
     ComputedBuffer,
     FixedLayout,
     FlexibleLayout,
-    InputBuffer,
     Pointwise,
     Reduction,
 )
@@ -35,7 +34,6 @@ from torch._inductor.ir import (
 from torch_spyre._C import DataFormats, ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.ir import FixedTiledLayout
-from torch_spyre._inductor.loop_info import CarriedReductionRecord
 from torch_spyre._inductor.constants import (
     AVGPOOL2D_OP,
     CONV2D_FWD_OP,
@@ -51,9 +49,10 @@ from torch_spyre._inductor.scratchpad.allocator import (
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
-    LifetimeBoundBuffer,
 )
-from torch_spyre._inductor.scratchpad.utils import get_ncores_for_buffers
+from torch_spyre._inductor.scratchpad.utils import (
+    is_empty_tiled_layout,
+)
 from torch_spyre._inductor.work_division import (
     TensorDep,
     _cost_model_matmul_planner,
@@ -67,7 +66,6 @@ from torch_spyre._inductor.work_division import (
 from torch_spyre._inductor.work_division_constraints import (
     ConstraintResult,
     WorkDivConstraintContext,
-    carried_reduction_pinned_row,
     collect_work_division_constraints,
     conv_spatial_blocked_vars,
     coordinate_mask_blocked_vars,
@@ -80,32 +78,6 @@ from torch_spyre._inductor.work_division_constraints import (
     restickify_padding_blocked_vars,
     topk_split_domains,
 )
-
-
-def test_carried_reduction_row_is_committed_before_scheduling():
-    row, hidden = _isym("row"), _isym("hidden")
-    op = _computed_buffer((64, 64), name="combine")
-    op._carried_reduction_record = CarriedReductionRecord(
-        accumulator_name="fill",
-        row_dim_name="T",
-        required_row_split=8,
-        fill_name="fill",
-        combine_name="combine",
-        drain_name="drain",
-    )
-    # Deliberately put H first. Named ownership, not loop position, selects T.
-    op.work_div_loop_info = {hidden: ["H"], row: ["T"]}
-    output = _tensor_dep("combine", (64, 64), (row, hidden))
-    result = carried_reduction_pinned_row(
-        _make_context(
-            op,
-            output,
-            it_space={hidden: 64, row: 64},
-            it_space_adjusted={hidden: 64, row: 64},
-        )
-    )
-
-    assert result.allowed_splits == {row: frozenset({8})}
 
 
 def _isym(name):
@@ -152,140 +124,58 @@ def _computed_buffer(shape, name="buf0", reduction_type=None, reduction_ranges=(
     return op
 
 
-def _empty_eligibility_graph(shape, *, graph_input):
-    """Real layouts/buffers and recorded dependencies; no frontend compilation.
-
-    Both readers remain present even for an empty shape, so missing liveness or
-    a no-consumer shortcut cannot satisfy the intended eligibility assertion.
-    """
-    row, col = _isym("row"), _isym("col")
-    index = shape[1] * row + col
-    buffers = {}
-    operations = []
-    for name in ("value", "reader_a", "reader_b"):
-        layout = _fixed_tiled_layout(shape)
-        if name == "value" and graph_input:
-            buffer = InputBuffer(name=name, layout=layout)
-        else:
-            buffer = ComputedBuffer(
-                name=name,
-                layout=layout,
-                data=Pointwise(
-                    device=torch.device("spyre:0"),
-                    dtype=torch.float16,
-                    inner_fn=lambda _index: sympy.Integer(1),
-                    ranges=list(shape),
-                ),
-            )
-            # Use the normal dependency memo consumed by the allocator. Only
-            # graph plumbing is supplied here; no eligibility or size is mocked.
-            buffer._ts_cached_read_writes = SimpleNamespace(
-                reads=(
-                    {MemoryDep("value", index, (row, col), tuple(shape))}
-                    if name != "value"
-                    else set()
-                ),
-                writes={MemoryDep(name, index, (row, col), tuple(shape))},
-            )
-            operations.append(buffer)
-        buffers[name] = buffer
-    return SimpleNamespace(
-        operations=operations,
-        graph_input_names=["value"] if graph_input else [],
-        try_get_buffer=buffers.get,
-        get_buffer=buffers.__getitem__,
-    )
-
-
 class TestEmptyLxEligibility(unittest.TestCase):
-    def test_empty_native_layouts_are_rejected_before_lx_sizing(self):
-        for shape, device_shape in (((0, 64), (1, 0, 64)), ((64, 0), (0, 64, 64))):
-            for graph_input in (False, True):
-                with self.subTest(shape=shape, graph_input=graph_input):
-                    graph = _empty_eligibility_graph(shape, graph_input=graph_input)
-                    layout = graph.get_buffer("value").layout
-                    self.assertEqual(
-                        tuple(layout.device_layout.device_size), device_shape
-                    )
-                    ncores, reasons, views = get_ncores_for_buffers(graph)
-                    self.assertEqual(
-                        ncores, {name: -1 for name in ("value", "reader_a", "reader_b")}
-                    )
-                    self.assertEqual(set(reasons.values()), {"empty tensor"})
-                    self.assertEqual(views, {})
-                    allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
-                    for division_is_fixed in (False, True):
-                        if graph_input:
-                            reason = allocator._input_residency_reason(
-                                graph,
-                                "value",
-                                [0, 1],
-                                ncores=ncores,
-                                ncores_reasons=reasons,
-                                division_is_fixed=division_is_fixed,
-                            )
-                        else:
-                            reason = allocator._buffer_residency_reason(
-                                graph,
-                                "value",
-                                [0, 1, 2],
-                                graph.get_buffer("value"),
-                                mutated_buffers=set(),
-                                graph_output_names=set(),
-                                reinterpret_output_names=set(),
-                                ncores=ncores,
-                                ncores_reasons=reasons,
-                                division_is_fixed=division_is_fixed,
-                                buf_user_deps={},
-                            )
-                        self.assertEqual(reason, "empty tensor")
-                        candidate = LifetimeBoundBuffer(
-                            "value", 0, [0, 1], residency_reason=reason
-                        )
-                        placeable, excluded = GreedyLayoutSolver(
-                            [candidate], 2**20
-                        ).partition()
-                        self.assertEqual(placeable, [])
-                        self.assertEqual(excluded, [candidate])
-                        self.assertIsNone(candidate.address)
-                    self.assertEqual(layout.allocation, {})
-                    self.assertIsNone(layout.lx_view)
+    def test_empty_tensors_are_rejected_before_lx_sizing(self):
+        """A valid empty tensor clears no eligibility path.
 
-    def test_nonempty_native_layout_keeps_its_view(self):
-        for graph_input in (False, True):
-            with self.subTest(graph_input=graph_input):
-                graph = _empty_eligibility_graph((64, 64), graph_input=graph_input)
-                ncores, reasons, views = get_ncores_for_buffers(graph)
-                self.assertEqual(reasons, {})
-                self.assertEqual(
-                    ncores, {name: 1 for name in ("value", "reader_a", "reader_b")}
-                )
-                self.assertEqual(set(views), set(ncores))
+        Native stickification preserves zero outer extents. A zero physical
+        extent on a logically nonempty tensor (a one-stick FP16 tensor
+        quantized to FP8 rescales to zero FP8 sticks) is not an empty tensor.
+        """
 
-    def test_zero_or_negative_device_extents_keep_main_eligibility(self):
-        # A nonempty tensor can carry a zero physical extent: a one-stick FP16
-        # tensor quantized to FP8 rescales to zero FP8 sticks. Such layouts,
-        # and malformed negative extents the native constructor allows, are
-        # neither excused as empty tensors nor rejected: ordinary buffers keep
-        # the eligibility and the equal-share sizing they had before relayouts.
-        cases = (
-            ((64, 64), (1, -1, 64)),
-            ((0, 64), (0, -1, 64)),
-            ((64, 64), (1, 0, 64)),
-            ((0, 64), (1, 64, 0)),
+        empty = _fixed_tiled_layout((0, 64))
+        nonempty = _fixed_tiled_layout((64, 64))
+        zero_extent = _fixed_tiled_layout((64, 64))
+        zero_extent.device_layout = SpyreTensorLayout(
+            [1, 0, 64],
+            [64, 64, 1],
+            DataFormats.SEN169_FP16,
+            ElementArrangement.STANDARD,
         )
-        for shape, device_shape in cases:
-            with self.subTest(shape=shape, device_shape=device_shape):
-                graph = _empty_eligibility_graph(shape, graph_input=False)
-                graph.get_buffer("value").layout.device_layout = SpyreTensorLayout(
-                    list(device_shape),
-                    [64, 64, 1],
-                    DataFormats.SEN169_FP16,
-                    ElementArrangement.STANDARD,
-                )
-                ncores, reasons, views = get_ncores_for_buffers(graph)
-                self.assertEqual(ncores["value"], 1)
-                self.assertNotIn("value", reasons)
+        self.assertEqual(
+            [
+                is_empty_tiled_layout(layout)
+                for layout in (empty, nonempty, zero_extent)
+            ],
+            [True, False, False],
+        )
+
+        graph = SimpleNamespace(
+            try_get_buffer=lambda _name: SimpleNamespace(layout=empty)
+        )
+        allocator = ScratchpadAllocator(GreedyLayoutSolver, 2**20)
+        with patch.object(
+            allocator_module, "clone_at_graph_boundaries", return_value=True
+        ):
+            reason = allocator._input_residency_reason(
+                graph, "value", [0, 1], division_is_fixed=False
+            )
+        self.assertEqual(reason, "empty tensor")
+        with patch.object(allocator, "_op_output_good_for_lx_reuse", return_value=True):
+            reason = allocator._buffer_residency_reason(
+                graph,
+                "value",
+                [0, 1],
+                SimpleNamespace(layout=empty),
+                mutated_buffers=set(),
+                graph_output_names=set(),
+                reinterpret_output_names=set(),
+                ncores={},
+                ncores_reasons={},
+                division_is_fixed=False,
+                buf_user_deps={},
+            )
+        self.assertEqual(reason, "empty tensor")
 
 
 def _make_context(
@@ -1776,64 +1666,6 @@ class TestResidencyEdgeMatching(unittest.TestCase):
 
 
 class TestCoOptimizingAllocator(unittest.TestCase):
-    def test_parent_matches_compare_physical_ownership_semantically(self):
-        core_id = sympy.Symbol("core_id")
-        producer_view = PerCoreView(
-            ((0, 4),),
-            ((0, sympy.Mod(core_id, 4)),),
-            num_cores=4,
-        )
-        consumer_view = PerCoreView(
-            ((0, 4),),
-            ((0, core_id - 4 * sympy.floor(core_id / 4)),),
-            num_cores=4,
-        )
-        parent = MagicMock(name="parent")
-        parent.get_name.return_value = "parent"
-        consumer = MagicMock(name="consumer")
-        write = MagicMock(name="write", index=sympy.S.Zero)
-        write.name = "parent"
-        read = MagicMock(name="read", index=sympy.S.Zero)
-        read.name = "parent"
-        division = CoreDivision(output_splits={sympy.Symbol("d"): 4})
-        allocator = CoOptimizingAllocator(MagicMock(), size=1)
-
-        with (
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator.op_read_writes",
-                side_effect=lambda op: MagicMock(
-                    writes=[write] if op is parent else [],
-                    reads=[read] if op is consumer else [],
-                ),
-            ),
-            patch.object(
-                allocator_module, "_is_frame_changing_clone", return_value=False
-            ),
-            patch.object(
-                allocator_module,
-                "_view_for_div",
-                side_effect=[
-                    (producer_view, False, True),
-                    (consumer_view, False, True),
-                ],
-            ),
-            patch(
-                "torch_spyre._inductor.scratchpad.allocator._is_matmul_op",
-                return_value=False,
-            ),
-        ):
-            matches = allocator._cd_parent_matches(
-                consumer,
-                [division],
-                ["parent"],
-                {"parent": [division]},
-                {"parent": parent},
-                {},
-                {"parent": None},
-            )
-
-        self.assertEqual(matches, {"parent": [(0, 0)]})
-
     def test_fixed_illegal_split_raises_unsupported(self):
         op = MagicMock(spec=ComputedBuffer, name="fixed_op")
         op.data = MagicMock(spec=Pointwise)

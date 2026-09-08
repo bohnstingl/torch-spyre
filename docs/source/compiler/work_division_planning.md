@@ -581,6 +581,34 @@ A graph-aware co-optimisation pass exists and is opt-in via
 grow the LX planner's legal-reuse set. See the
 [scratchpad planning](scratchpad_planning.md) doc for details.
 
+## Placement-Aware Work Selection
+
+With LX relayout enabled and the greedy placement solver, the allocator also
+compares the default divisions with one whole-graph alternative: move part of
+each operation's existing output split to its outermost physical output axis.
+This can reduce the address range needed by each core without changing the core
+count. Compound coordinates, user hints and reduction splits are not changed.
+Both choices go through the existing ownership checks and paired-buffer placement;
+the bundle cost includes the resulting HBM traffic and added LX transfers. Only
+the winning choice is committed, before scheduling. This is a bounded heuristic,
+not an exhaustive search or a guarantee of lower measured latency.
+This initial policy considers only operations with static iteration extents,
+and runs only when the alternative changes an ordinary matmul. FP8 matmul
+divisions are unchanged: their compute is not yet covered by this cost extractor.
+Input loads and graph-output
+drains are included even when the buffer
+is placed in LX. A tie, unavailable prediction or failed candidate placement
+keeps the existing choice; a baseline that cannot be priced is never replaced.
+Ownership and allocation assertions remain mandatory, not cost-model fallbacks.
+It runs two trial placements followed by normal placement (three solves
+instead of one), deliberately keeping trial state out of the committed graph.
+There is no extra feature switch: `SPYRE_LX_PLANNER_RELAYOUT=1` enables this
+comparison with the greedy solver. Other solvers retain their existing behavior.
+An explicit work-division hint protects that operation, not all its neighbors;
+the usual ownership checks still decide whether their data can stay in LX.
+Model initialization may take longer; measure warmed inference separately from
+compilation. Turning the switch off restores the original selection path.
+
 ## User Work-Division Hints
 
 Users can override the automatic work-distribution choice with
