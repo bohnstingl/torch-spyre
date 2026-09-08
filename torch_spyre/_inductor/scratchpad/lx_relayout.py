@@ -717,6 +717,13 @@ def _is_activation_source(
     )
 
 
+def _supports_cross_domain_broadcast(consumer: ComputedBuffer) -> bool:
+    return _is_matmul_op(consumer) or (
+        config.lx_pointwise_broadcast_relayout
+        and isinstance(consumer.data, Pointwise)
+    )
+
+
 def _unsupported_relayout_transition_reason(
     source_work_division: TensorWorkDivision,
     destination_work_division: TensorWorkDivision,
@@ -886,14 +893,17 @@ def collect_lx_relayout_plans(
                     "cannot emit: consumer uses fewer physical cores than producer"
                 )
                 break
-            if consumer_num_cores > source_num_cores and not _is_matmul_op(consumer):
+            if consumer_num_cores > source_num_cores and not (
+                _supports_cross_domain_broadcast(consumer)
+            ):
                 rejection_reason = (
-                    "cannot emit: grouped broadcast requires a matmul consumer"
+                    "cannot emit: grouped broadcast requires a supported consumer"
                 )
                 break
             if (
                 consumer_num_cores > source_num_cores
                 and consumer_num_cores != config.sencores
+                and not config.lx_pointwise_broadcast_relayout
             ):
                 rejection_reason = (
                     "cannot emit: grouped broadcast must target all compute cores"

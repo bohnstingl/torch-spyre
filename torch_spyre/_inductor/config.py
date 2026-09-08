@@ -77,6 +77,12 @@ lx_consumer_anchored_ordering: bool = _get_env_bool(
     "SPYRE_LX_CONSUMER_ANCHORED_ORDERING", False
 )
 
+# Experimental: permit exact cross-domain LX broadcasts into pointwise clones.
+# This covers explicit expand/clone nodes feeding a wider ownership domain.
+lx_pointwise_broadcast_relayout: bool = _get_env_bool(
+    "SPYRE_LX_POINTWISE_BROADCAST_RELAYOUT", False
+)
+
 # Experimental: allow restickify operands to remain in LX only after exact
 # physical ownership proves each reader consumes the same core's input slice.
 lx_restickify_residency: bool = _get_env_bool("SPYRE_LX_RESTICKIFY_RESIDENCY", False)

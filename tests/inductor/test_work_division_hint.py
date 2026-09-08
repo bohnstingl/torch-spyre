@@ -833,6 +833,25 @@ def test_lx_relayout_kinds_share_one_edge_derivation():
         lx_relayout_module._transfer_edges(wrong_domain, broadcast_destination, 2, 32)
 
 
+def test_pointwise_cross_domain_broadcast_is_gated(monkeypatch):
+    class FakePointwise:
+        pass
+
+    consumer = SimpleNamespace(data=FakePointwise())
+    monkeypatch.setattr(lx_relayout_module, "Pointwise", FakePointwise)
+    monkeypatch.setattr(lx_relayout_module, "_is_matmul_op", lambda _op: False)
+
+    monkeypatch.setattr(
+        lx_relayout_module.config, "lx_pointwise_broadcast_relayout", False
+    )
+    assert not lx_relayout_module._supports_cross_domain_broadcast(consumer)
+
+    monkeypatch.setattr(
+        lx_relayout_module.config, "lx_pointwise_broadcast_relayout", True
+    )
+    assert lx_relayout_module._supports_cross_domain_broadcast(consumer)
+
+
 def test_grouped_gather_can_contract_two_dimensions():
     source = PerCoreView(
         ((0, 4), (1, 8)),
