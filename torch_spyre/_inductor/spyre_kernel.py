@@ -36,8 +36,6 @@ from torch._inductor.virtualized import V
 from .constants import (
     SPYRE_FP32_OPS,
     SPYRE_INT32_OPS,
-    BATCH_MATMUL_OP,
-    BATCH_MATMUL_FP8_OP,
     CONV_OPS,
     DEPTHWISE_CONV_REDUCTION_OPS,
     IDENTITY_OP,
@@ -46,7 +44,6 @@ from .constants import (
     RESTICKIFY_OP,
     SEGMENT_OFFSETS,
     TWO_INPUT_REDUCTION_OPS,
-    SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 from . import config as _spyre_config
 from .core_mapping import (
@@ -59,15 +56,15 @@ from .ir import FixedTiledLayout
 from .scratchpad.lx_relayout import work_division_from_view
 from .pass_utils import (
     AlignmentAccess,
+    build_operation_alignment_inputs,
     concretize_expr,
     compute_symbolic_bounds,
     finite_upper_or_none,
     iteration_space,
+    iteration_space_with_splits,
     indirect_access_subs_from_kernel,
     is_restickify_coords,
     alignment_coordinates,
-    build_operation_alignment_inputs,
-    iteration_space_with_splits,
 )
 from .views import (
     AlignmentInputs,
@@ -103,76 +100,6 @@ class TensorAccess(RValue):
     name: str
     index: sympy.Expr
     layout: FixedTiledLayout
-
-
-def _preserve_shared_weight_unit_bmm_dim(
-    op: str,
-    it_space: dict[sympy.Symbol, tuple[sympy.Expr, int]],
-    args: Sequence[TensorArg],
-    op_info: dict[str, Any],
-) -> dict[sympy.Symbol, tuple[sympy.Expr, int]]:
-    # TensorArg layout is normalized in-place below to match the surrounding
-    # OpSpec construction helpers.
-    if SHARED_WEIGHT_UNIT_BMM_INFO_KEY not in op_info:
-        return it_space
-    if op not in [BATCH_MATMUL_OP, BATCH_MATMUL_FP8_OP]:
-        return it_space
-    if len(it_space) != 3 or len(args) < 3:
-        return it_space
-    info = op_info.get(SHARED_WEIGHT_UNIT_BMM_INFO_KEY)
-    if not isinstance(info, dict) or info.get("batch_dim") != 0:
-        return it_space
-
-    unit_sym = sympy.Symbol("_spyre_bmm_unit")
-    suffix = 0
-    while unit_sym in it_space:
-        suffix += 1
-        unit_sym = sympy.Symbol(f"_spyre_bmm_unit_{suffix}")
-
-    def _unit_indices(arg: TensorArg) -> list[int]:
-        return [
-            idx
-            for idx, (size, coord) in enumerate(
-                zip(arg.device_size[:-1], arg.device_coordinates[:-1])
-            )
-            if concretize_expr(size) == 1 and coord == 0
-        ]
-
-    target_args = (args[0], args[-1])
-    # The unit-BMM marker is only valid for plain rank-3 BMMs after layout
-    # construction. If a target tensor still carries extra physical axes, such
-    # as attention heads from SDPA, rewriting one axis into the BMM iteration
-    # space can produce an illegal SDSC layout.
-    if any(len(arg.device_size) > 4 for arg in target_args):
-        return it_space
-    unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
-
-    if all(len(unit_idxs) == 0 for unit_idxs in unit_idxs_by_arg):
-        for arg in target_args:
-            if len(arg.device_size) < 2:
-                return it_space
-            insert_at = len(arg.device_size) - 1
-            arg.device_size.insert(insert_at, 1)
-            arg.device_coordinates.insert(insert_at, sympy.S.Zero)
-        unit_idxs_by_arg = [_unit_indices(arg) for arg in target_args]
-
-    if not all(len(unit_idxs) == 1 for unit_idxs in unit_idxs_by_arg):
-        return it_space
-
-    rewrite_targets = [
-        (arg, unit_idxs[0]) for arg, unit_idxs in zip(target_args, unit_idxs_by_arg)
-    ]
-
-    for arg, unit_idx in rewrite_targets:
-        arg.device_coordinates[unit_idx] = unit_sym
-        nonstick = list(range(len(arg.device_size) - 1))
-        order = [unit_idx] + [i for i in reversed(nonstick) if i != unit_idx]
-        order.append(len(arg.device_size) - 1)
-        arg.device_size[:] = [arg.device_size[i] for i in order]
-        arg.device_coordinates[:] = [arg.device_coordinates[i] for i in order]
-
-    logger.info("Preserving shared-weight unit BMM dim %s", unit_sym)
-    return {unit_sym: (sympy.S.One, 1), **it_space}
 
 
 @dataclass
@@ -358,6 +285,19 @@ class SpyreOpFuncs:
     @staticmethod
     def qfp8wt(x):
         return PointwiseOp("qfp8wt", [x])
+
+    @staticmethod
+    def quantscalepertokenfp8(x, scale_ub):
+        # scale_ub must remain in the signature: Inductor dispatches this method via
+        # SpyreKernelOpsHandler._default(name, args, kwargs) passing all op arguments,
+        # so dropping it would cause a TypeError at codegen time.
+        #
+        # It is intentionally unused here: scale_ub is already baked into `mulConst`
+        # inside SpyreReduction.op_info at lowering time (lower_quantscalepertokenfp8).
+        # For reductions, kernel_store_reduction reads op_info exclusively from
+        # ir_node.data.op_info (the SpyreReduction), not from ReductionOp.op_info.
+        _ = scale_ub
+        return ReductionOp("quantscalepertokenfp8", [x])
 
     @staticmethod
     def relu(x):
@@ -588,6 +528,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         self._alignment_access_by_tensor_arg: dict[int, AlignmentAccess] = {}
         self._alignment_inputs_by_spec: dict[int, AlignmentInputs] = {}
         self.pool_size: int = pool_size
+        # Live call args, deduped and filtered to names in spyre_kernel_args.
+        # Set by codegen_kernel(); used by call_kernel() to ensure arg_index
+        # values match .run() positional args.
+        self._live_call_arg_names: list[str] | None = None
 
     def indirect_var_names(self) -> "frozenset[str] | None":
         if not self.indirect_vars:
@@ -720,7 +664,25 @@ class SpyreKernel(Kernel[CSEVariable]):
                 for dep in ir_node.get_read_writes().reads
                 if isinstance(dep, MemoryDep)
             ]
-            matching_idx = [i for i, dep in enumerate(read_deps) if dep.name == name]
+            # `name` has already been resolved through mutation_real_name by
+            # load() (e.g. coarse_tile_copy_buf19's dep is named "buf19" --
+            # tiled_op's own output identity -- but load() passes in "buf2",
+            # buf19's MutationLayoutSHOULDREMOVE target, since that's the
+            # actual underlying buffer). dep.name is the pre-resolution
+            # identity, so it must go through the same resolution before
+            # comparing, or a dep on a mutation alias never matches its own
+            # resolved name and this falls through to "no advance" every
+            # time (issue: flash-v2's B-tiled denominator/output copy-out
+            # reads silently pinned to tile 0).
+            scheduler = getattr(V.graph, "scheduler", None)
+            mutation_real_name = (
+                scheduler.mutation_real_name if scheduler is not None else {}
+            )
+            matching_idx = [
+                i
+                for i, dep in enumerate(read_deps)
+                if mutation_real_name.get(dep.name, dep.name) == name
+            ]
             if not matching_idx:
                 return None
             # Positional tie-break: if this buffer is read more than once,
@@ -901,9 +863,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         it_space_extended = iteration_space_with_splits(
             ir_node, self.current_node.read_writes, it_space
         )
-        it_space_extended = _preserve_shared_weight_unit_bmm_dim(
-            op, it_space_extended, args, op_info
-        )
         alignment_inputs = build_operation_alignment_inputs(
             it_space,
             [self._alignment_access_by_tensor_arg[id(arg)] for arg in args],
@@ -933,12 +892,36 @@ class SpyreKernel(Kernel[CSEVariable]):
         raw_tiled_red_dims: list[list[int]] = (
             li.loop_tiled_reduction_dims if li is not None else []
         )
+        # A dim tiled down to a per-tile extent of 1 is squeezed out of the
+        # op's own iteration space entirely (no d{i} symbol survives), so it
+        # is invisible to loop_tiled_dims/loop_tiled_reduction_dims and can
+        # only advance via squeezed_advance_per_read/squeezed_advance_output
+        # (see coarse_tile.py's _insert_all_read_copy_ops, the "d not in
+        # squeeze_pos" branch). _general_tile_advance already mints/uses a
+        # level symbol from squeezed_advance_per_level regardless of
+        # loop_tiled_dims, so has_any_tiled_dim must check the same fields —
+        # otherwise the minted symbol shows up in device_tile_advance_expr
+        # but never in OpSpec.tiled_symbols, and superdsc.py's affine-stride
+        # extraction (which only walks tiled_symbols) silently drops the
+        # advance, leaving the tensor's address pinned across that level's
+        # iterations instead of stepping through it.
+        raw_squeezed_advance_reads: list[list[list[tuple]]] = (
+            li.squeezed_advance_per_read if li is not None else []
+        )
+        raw_squeezed_advance_output: list[list[tuple]] = (
+            li.squeezed_advance_output if li is not None else []
+        )
         # CoarseTileInfo always constructs loop_tiled_dims and
         # loop_tiled_reduction_dims with the same length (one sublist per
         # nesting level), so max() is just a safety net; in practice both
         # lists have the same length and the per-level loop below never
         # silently drops an entry from the shorter one.
-        n_levels = max(len(raw_tiled_dims), len(raw_tiled_red_dims))
+        n_levels = max(
+            len(raw_tiled_dims),
+            len(raw_tiled_red_dims),
+            max((len(levels) for levels in raw_squeezed_advance_reads), default=0),
+            len(raw_squeezed_advance_output),
+        )
 
         tiled_symbol_trip_counts: dict = {}
         tiled_syms: list[list] = []
@@ -950,8 +933,17 @@ class SpyreKernel(Kernel[CSEVariable]):
             for lvl in range(n_levels):
                 level_syms: list = []
                 has_any_tiled_dim = (
-                    lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl]
-                ) or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                    (lvl < len(raw_tiled_dims) and raw_tiled_dims[lvl])
+                    or (lvl < len(raw_tiled_red_dims) and raw_tiled_red_dims[lvl])
+                    or any(
+                        lvl < len(levels) and levels[lvl]
+                        for levels in raw_squeezed_advance_reads
+                    )
+                    or (
+                        lvl < len(raw_squeezed_advance_output)
+                        and raw_squeezed_advance_output[lvl]
+                    )
+                )
                 if has_any_tiled_dim:
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
@@ -1320,8 +1312,19 @@ class SpyreKernel(Kernel[CSEVariable]):
                 return f"IndirectAccess('{name_sym}')"
             return "sympify('" + str(x) + "')"
 
-        # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
-        actuals = self.args.python_argdefs()[1]
+        # Compute live, deduped call-arg list from names in spyre_kernel_args.
+        # python_argdefs() includes all registered names from load()/store(),
+        # but spyre_kernel_args only has those surviving to the final op specs
+        # (excludes dead names like gather indices folded away by simplify_op_spec).
+        # Use this list for arg_index assignment so positional .run() args match.
+        live_names = {name for name, _ in self.spyre_kernel_args}
+        actuals = []
+        seen_actuals: set[str] = set()
+        for name in self.args.python_argdefs()[1]:
+            if name in live_names and name not in seen_actuals:
+                seen_actuals.add(name)
+                actuals.append(name)
+        self._live_call_arg_names = actuals
         has_pool_allocations = self.pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
@@ -1389,17 +1392,12 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             call_args.append(pool_var_name)
 
-        # Add remaining kernel arguments, deduplicating tensors that appear
-        # as both input and output (e.g. in-place ops like x *= 2).  With
-        # symbolic args the MLIR bundle emits one
-        # !sdscbundle.input_arg<index> per unique arg_index; passing the
-        # same tensor twice would cause a runtime "Number of inputs
-        # mismatches" error in processComputeOnHostCommand.
-        seen: set[str] = set()
-        for arg in self.args.python_argdefs()[1]:
-            if arg not in seen:
-                seen.add(arg)
-                call_args.append(arg)
+        # Use live call args computed in codegen_kernel() to keep positional
+        # .run() args in sync with arg_index values baked into op specs.
+        assert self._live_call_arg_names is not None, (
+            "call_kernel() requires codegen_kernel() to have run first"
+        )
+        call_args.extend(self._live_call_arg_names)
 
         call_args_str = ", ".join(call_args)
         wrapper.writeline(f"{name}.run({call_args_str})")

@@ -19,13 +19,13 @@ scratchpad planning) consume that plan.
 ## Three-pass planner overview
 
 The planner has three responsibilities, one per pass: **Pass 1
-enforces the 255.996 MiB per-core span limit, Pass 2 selects matmul splits
+enforces the 256 MB per-core span limit, Pass 2 selects matmul splits
 from a cost model, and Pass 3 selects a default split for every other
 eligible op.**
 
 For each eligible op the planner runs three passes in order:
 
-1. **Pass 1, span reduction**, enforces the 255.996 MiB per-core span limit.
+1. **Pass 1, span reduction**, enforces the 256 MB per-core span limit.
    When a tensor's per-core span exceeds the limit, this pass commits
    the minimum splits needed to bring the span back under. When no
    tensor violates the limit, the pass leaves the op untouched.
@@ -123,9 +123,9 @@ element counts to stick counts so core splits always align to stick
 boundaries. When tensors of different dtypes share a stick variable,
 the conversion uses the largest `elems_per_stick` across those tensors.
 
-### Per-core memory span (255.996 MiB)
+### Per-core memory span (256 MB)
 
-Each Spyre core has a 255.996 MiB limit on the memory span it can address.
+Each Spyre core has a 256 MB limit on the memory span it can address.
 The per-core span for a tensor is the contiguous range of device memory
 (in bytes) that a single core must read or write under a particular
 split assignment. The outermost device dimension a core touches sets
@@ -161,7 +161,7 @@ A card has 32 cores connected by a bi-directional ring.
 |---|---|---|
 | Cores per card | 32 (configurable down to 1 via `SENCORES`) | Total core budget Pass 3 distributes |
 | PT rows per corelet | 8 | Pass 2's compute term and M tie-break |
-| Per-core memory span | 255.996 MiB | Pass 1's correctness constraint |
+| Per-core memory span | 256 MB | Pass 1's correctness constraint |
 | Stick size | 128 B (`BYTES_IN_STICK`); element count from `device_dtype.elems_per_stick()` | Stick-aligned splits across all passes |
 
 For the full hardware overview see
@@ -170,7 +170,7 @@ For the full hardware overview see
 :::{admonition} Common misconceptions
 :class: warning
 
-- **The 255.996 MiB span is not the 2 MB LX.** The span limit is a per-core
+- **The 256 MB span is not the 2 MB LX.** The span limit is a per-core
   *addressable device memory* range. The 2 MB LX scratchpad is a
   separate on-core SRAM whose placement is decided by
   [scratchpad planning](scratchpad_planning.md), not work division.
@@ -179,9 +179,10 @@ For the full hardware overview see
   that hard-codes "64 fp16 elements" is fp16-specific.
 - **The cost-model planner does not change correctness.** Pass 2's
   matmul split is correct on its own. The runtime benefit of any
-  K-split comes from a paired codegen layer in `codegen/superdsc.py`
-  that permutes physical core IDs so K-collaborators occupy adjacent
-  ring positions.
+  K-split comes from a paired core-ID permutation
+  (`core_to_slice_mapping` in `core_mapping.py`, applied during
+  pre-scheduling in `pass_utils.py`) that permutes physical core IDs so
+  K-collaborators occupy adjacent ring positions.
 :::
 
 ## Pass 1 — Span Reduction (`span_reduction`)
@@ -189,11 +190,11 @@ For the full hardware overview see
 This pass is mandatory and runs first over every eligible op.
 
 For each operation, `span_reduction_pass` computes the minimum splits
-required to keep every tensor's per-core memory span within 255.996 MiB
+required to keep every tensor's per-core memory span within 256 MB
 (`must_split_vars`).
 
 `must_split_vars` processes tensors one at a time. For each tensor whose
-per-core span exceeds 255.996 MiB, it iterates over device dimensions outer
+per-core span exceeds 256 MB, it iterates over device dimensions outer
 to inner and searches for the best split combination (Cartesian product
 of valid divisors for the variables contributing to that dimension)
 that satisfies the hardware limit. The search applies a two-tier
@@ -217,15 +218,15 @@ A: [8192, 32768] fp16, total 512 MB
 
 Unsplit                          Split K by 2
 ┌───────────────────────────┐    ┌──────────────┬──────────────┐
-│       512 MB per core     │    │ 255.996 MiB / core│ 255.996 MiB / core│
-│   (violates 255.996 MiB limit) │    │     core 0   │     core 1   │
+│       512 MB per core     │    │ 256 MB / core│ 256 MB / core│
+│   (violates 256 MB limit) │    │     core 0   │     core 1   │
 └───────────────────────────┘    └──────────────┴──────────────┘
               ✗                                  ✓
 ```
 
 The arithmetic generalises:
 `per_core_span = (dim_size / split) × outer_stride × dtype_bytes`. Pass 1
-picks the smallest `split` that brings the span under 255.996 MiB on the
+picks the smallest `split` that brings the span under 256 MB on the
 outermost dimension that violates it.
 
 ## Pass 2 — Cost-Model Matmul Division (`cost_model_matmul_division`)
@@ -429,7 +430,7 @@ Two op-kind constraints apply on top of the algorithm above. For
 pointwise ops there is no reduction dimension, so the ranking step
 considers only output dimensions. For reductions, span-required splits
 may include at most one reduction variable. If more than one reduction
-variable would have to be split to satisfy the 255.996 MiB span limit, the
+variable would have to be split to satisfy the 256 MB span limit, the
 compiler raises an error.
 
 (topk-work-division)=
@@ -479,7 +480,7 @@ dim `K`.
 | Tensor | Unsplit per-core span | Violating dim | Pass 1 commit | After Pass 3 | Cores reading it |
 |---|---|---|---|---|---|
 | A `[8192, 32768]` fp16 | 512 MB | K (outermost) | K minimum = 2 | M = 16, K = 2 | each core reads (512 rows) × (16384 K) = 16 MB |
-| W `[32768, 4096]` fp16 | 255.996 MiB | none (at limit) | — | M = 16, K = 2 | each core reads (16384 K) × (4096 N) = 128 MB |
+| W `[32768, 4096]` fp16 | 256 MB | none (at limit) | — | M = 16, K = 2 | each core reads (16384 K) × (4096 N) = 128 MB |
 | O `[8192, 4096]` fp16 | 64 MB | none | — | M = 16, K = 2 | each core writes (512 rows) × 4096 = 4 MB |
 
 Pass 2 detects that Pass 1 already committed a split (`K = 2`). The
@@ -502,7 +503,8 @@ Final split: `{M: 16, N: 1, K: 2}`.
 ### Core grid
 
 The 32 cores form a 16 × 2 grid: 16 along M, paired up across the K
-split. The codegen-side permutation in `codegen/superdsc.py` (see
+split. The core-ID permutation (`core_to_slice_mapping` in
+`core_mapping.py`, applied in `pass_utils.py`; see
 [Codegen pairing for K-splits](#codegen-pairing-for-k-splits))
 arranges the K-collaborators on adjacent ring positions, so
 `(c0, c1)` accumulate M-slice 0, `(c2, c3)` accumulate M-slice 1,
@@ -531,12 +533,13 @@ commits the argmin. Pass 3 skips the op.
 
 ### Codegen pairing for K-splits
 
-When any planner selects a K-split, the SDSC emitter permutes physical
+When any planner selects a K-split, the compiler permutes physical
 core IDs so the cores collaborating on the K reduction occupy adjacent
 ring positions. The permutation is implemented in
 `core_to_slice_mapping` in `core_mapping.py`, invoked from
-`codegen/superdsc.py` with a `contiguous_dim` argument, and gated by the
-`core_id_k_fast_emission` config flag. It drops PSUM accumulation hops from
+`pass_utils.py` with a `contiguous_dim` argument, and gated by the
+`core_id_k_fast_emission` config flag (checked in `pass_utils.py` and
+`spyre_kernel.py`). It drops PSUM accumulation hops from
 `m × n` to 1, which is what makes cross-core K reductions cheap at
 runtime. The flag `SPYRE_CORE_ID_K_FAST_EMISSION` (default on)
 controls this codegen-side permutation. The name is legacy from when
@@ -600,6 +603,7 @@ declare_tensor_dim("N", N)
 name_tensor_dims(x, ["M", "K"])
 name_tensor_dims(y, ["K", "N"])
 
+
 def fn(x, y):
     with spyre_hint(work_div={"M": 2, "K": 4}):
         return x @ y
@@ -624,7 +628,7 @@ the accepted split decision. Validation checks that:
 - at most one accepted reduction dimension is split
 
 User work-division hints are intentionally authoritative. If Pass 1
-(`span_reduction`) already committed minimum splits for the 255.996 MiB span limit,
+(`span_reduction`) already committed minimum splits for the 256 MB span limit,
 and the user hint asks for fewer splits, the compiler logs a warning and applies
 the strict user hint. `raise_if_per_core_overflow` then raises `Unsupported` if
 the resulting per-core span exceeds the hardware limit.
