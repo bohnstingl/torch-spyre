@@ -14,7 +14,7 @@
 
 """Lowering tests for `for_each_tile`: the loop must reach a `while_loop`, and copy nothing.
 
-Eleven cases:
+Twelve cases:
 
   A     tile M as a map: step `i` takes a row band of X, sees Y whole, and its result
         tile is laid along dim 0 of the output. The map level in its smallest form.
@@ -32,6 +32,10 @@ Eleven cases:
         at `out_dim=0`.
   F     split-K whose carry is `(counter, acc)`, with a closed-over `Z` indexed by the
         counter each step: how a body learns its own tile index without a tile spec.
+  G     flash attention's inner KV loop alone: one level, a 3-leaf `(m, denom, acc)`
+        online-softmax carry, Q closed over whole. The multi-leaf reduction carry in
+        isolation, and the shape whose carry reaches `scan` untouched -- neither map mode
+        nor the counter workaround applies. Costs nothing at all.
   PA_B  a miniature paged attention with both of the body's matmuls tiled along their
         contraction axis, i.e. case C nested inside a page loop: three while_loop levels
         in one kernel.
@@ -101,8 +105,7 @@ from typing import NamedTuple
 import torch
 from torch._inductor.utils import run_and_get_code
 
-from torch_spyre._inductor.wsr import for_each_tile, Gather
-
+from torch_spyre._inductor.wsr import Gather, for_each_tile
 
 DUMP_DIR = os.environ.get("SPYRE_FOR_EACH_TILE_DUMP")
 
@@ -283,6 +286,27 @@ def matmul_inputs():
     X = torch.randn(M, K)
     Y = torch.randn(K, N)
     return (X, Y), X @ Y
+
+
+# Online-softmax settings for case G: one 128-token query block against a 256-token KV
+# span in two tiles, at flash attention's own head size. `HEAD_DIM` is spelled out
+# rather than `D` because a bare `D` reads as case D in this file.
+#
+# fp32, like the rest of the suite, deliberately: a real kernel runs this recurrence in
+# fp16, but at that precision the two-tile accumulation drifts ~2e-2 from a dense
+# reference and the numeric check would have to be loosened past the point where it
+# could still catch a wrong recurrence. Precision is the backend's problem; what is
+# under test here is the graph.
+LQ, LK, HEAD_DIM = 128, 256, 128
+SOFTMAX_TILE_SIZE = 128
+
+
+def attention_inputs():
+    torch.manual_seed(0)
+    Q = torch.randn(LQ, HEAD_DIM)
+    K_mat = torch.randn(LK, HEAD_DIM)
+    V_mat = torch.randn(LK, HEAD_DIM)
+    return Q, K_mat, V_mat
 
 
 def nest(axes, tM, tK, tN):
@@ -741,6 +765,67 @@ class TestForEachTileLowering(unittest.TestCase):
             return final
 
         self._assert_lowers(fn, (X, Y, Z), ref, name="F_counter_carry", loops=1)
+
+    def test_online_softmax_carry(self):
+        """G: one level, a 3-leaf carry -- flash attention's inner loop on its own.
+
+        The KV loop of PA_B with everything around it removed: no page pool, no mask
+        stack, no head axes, no outer level. Q is closed over whole and K/V are
+        co-indexed `Kind.SLICE` along Lk, so the carry `(m, denom, acc)` -- running max,
+        running sum-of-exp, weighted accumulator -- carries the entire online-softmax
+        recurrence, and the result is a function of the final carry alone.
+
+        Read it for what a MULTI-LEAF reduction carry costs: nothing. Zero
+        materializations, the only case in the suite that both accumulates and stays at
+        zero -- three leaves in, three leaves out, no `ys` buffer because `out_dim` is
+        None, and no fold because there is no stack to fold. Cases C and PA_D also cost
+        nothing, but with a single leaf and no arithmetic respectively; this is the shape
+        a real attention kernel carries, at a real attention size, and it is the one
+        `for_each_tile` shape whose carry the frontend hands over untouched -- a 3-leaf
+        `init` is neither `map_mode` nor `count_mode`, so `scan` sees the user's own
+        pytree and the loop index is `decompose_scan_to_while_loop`'s alone.
+
+        The reference is a dense `softmax(Q @ K.T) @ V`, so the recurrence is checked
+        against the thing it is supposed to compute rather than against a second copy of
+        itself, at the suite's default tolerances (see `attention_inputs` on the dtype).
+        """
+        Q, Kmat, Vmat = attention_inputs()
+        ref = torch.softmax(Q @ Kmat.transpose(-1, -2), dim=-1) @ Vmat
+
+        def fn(Q, Kmat, Vmat):
+            def body(carry, tiles):
+                m, denom, acc = carry
+                k_tile, v_tile = tiles
+                scores = Q @ k_tile.transpose(-1, -2)
+                m_new = torch.maximum(m, scores.amax(dim=-1, keepdim=True))
+                correction = torch.exp(m - m_new)
+                p = torch.exp(scores - m_new)
+                denom_new = denom * correction + p.sum(dim=-1, keepdim=True)
+                acc_new = acc * correction + p @ v_tile
+                return (m_new, denom_new, acc_new), None
+
+            rows = (Q.shape[0], 1)
+            (_, denom, acc), _ = for_each_tile(
+                body,
+                (Kmat, Vmat),
+                dims=(0, 0),
+                tile_size=SOFTMAX_TILE_SIZE,
+                init=(
+                    torch.full(rows, float("-inf"), dtype=Q.dtype),
+                    torch.zeros(rows, dtype=Q.dtype),
+                    torch.zeros_like(Q),
+                ),
+            )
+            return acc / denom
+
+        self._assert_lowers(
+            fn,
+            (Q, Kmat, Vmat),
+            ref,
+            name="G_online_softmax",
+            loops=1,
+            materializations=0,
+        )
 
     def test_paged_attention_nested_matmuls_inner2(self):
         """PA_B at 2 tiles per inner level."""

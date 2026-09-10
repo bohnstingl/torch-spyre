@@ -14,7 +14,6 @@
 
 """Working Set Reduction (coarse-tiling) pass implementations."""
 
-from .for_each_tile import for_each_tile, Gather
+from torch_spyre._inductor.wsr.for_each_tile import Gather, for_each_tile
 
-
-__all__ = ["for_each_tile", "Gather"]
+__all__ = ["Gather", "for_each_tile"]

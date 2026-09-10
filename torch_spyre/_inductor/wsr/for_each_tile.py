@@ -26,7 +26,6 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
-
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -34,7 +33,6 @@ import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
 from torch.utils._pytree import tree_leaves
-
 
 __all__ = ["Gather", "for_each_tile"]
 
