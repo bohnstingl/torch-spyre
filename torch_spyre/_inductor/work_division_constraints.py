@@ -451,9 +451,7 @@ def coarse_tile_local_dim_split_domains(
     raw_to_squeezed = _raw_to_squeezed_pos(ctx.op)
     hinted_syms = _hinted_work_div_syms(ctx)
 
-    def pin(
-        raw_pos: int, ranges: typing.Sequence[Expr], raw_base: int = 0
-    ) -> None:
+    def pin(raw_pos: int, ranges: typing.Sequence[Expr], raw_base: int = 0) -> None:
         # `raw_pos` is in loop_tiled_dims' raw numbering: output positions index
         # data.ranges, reduction positions are offset by len(data.ranges), which
         # the caller passes as raw_base.
