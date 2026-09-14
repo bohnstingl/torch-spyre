@@ -80,7 +80,6 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
-    coordinates_normalizable,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -588,18 +587,7 @@ def _single_arg_op_layout(
                 # reverse staggered-to-STANDARD restoration. It needs no
                 # expansion: preserve the stick selected before the upcast.
 
-                # Last-resort guard: device_coordinates only validates the stick
-                # expression, so a candidate whose *non-stick* coordinate is
-                # outside the normalization grammar survives until codegen's
-                # normalize_coordinates rejects it. Drop those while the dense
-                # reconstruction below is still reachable.
-                layouts = [
-                    out_stl
-                    for out_stl in layouts
-                    if coordinates_normalizable(out_stl, output_dep)
-                ]
-                if layouts:
-                    return layouts
+                return layouts
 
             # Dense reconstruction from the output host size. When the input
             # stick dim is unaligned, force a full input-stick depth so stick
