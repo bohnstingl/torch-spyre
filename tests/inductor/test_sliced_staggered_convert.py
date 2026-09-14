@@ -78,4 +78,4 @@ def test_native_rmsnorm_on_qkv_slice(shape, part):
     fn, args = _build(*_SHAPES[shape], part)
     expected = fn(*args)
     got = torch.compile(fn, dynamic=False)(*(a.to(DEVICE_NAME) for a in args))
-    torch.testing.assert_close(got.cpu(), expected, rtol=0.05, atol=0.05)
+    torch.testing.assert_close(got.cpu(), expected, rtol=0.01, atol=0.03)
