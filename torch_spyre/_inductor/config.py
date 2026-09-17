@@ -248,4 +248,21 @@ _cpsat_warn_on_cost_expr: bool = True
 # torch._inductor.config.force_disable_caches = True.
 spyre_kernel_cache: bool = os.environ.get("SPYRE_KERNEL_CACHE", "0") == "1"
 
+# Leave a `for_each_tile` loop's trip count symbolic through the frontend and
+# choose it at code generation, instead of baking it at trace time. The frontend
+# is 72-77% of a compile, so N counts cost `frontend + N*backend` rather than
+# `N*(frontend+backend)`. See `_inductor/trip_count_symbol.py` for the mechanism
+# and `execution/trip_count.py` for the launch side.
+#
+# The trace still fixes a *maximum*: every descriptor is sized and addressed for
+# the count the trace saw, and a smaller count simply stops the loop early. So
+# the count becomes an *ambient* input -- a kernel traced this way reads
+# `torch_spyre.execution.trip_count.current_trip_count()` and refuses to compile
+# or launch when it is unset, rather than falling back to the maximum. Turning
+# this on therefore requires every looped kernel's call site to be wrapped in
+# `with trip_count(k):`. Off by default.
+spyre_trip_count_variants: bool = (
+    os.environ.get("SPYRE_TRIP_COUNT_VARIANTS", "0") == "1"
+)
+
 install_config_module(sys.modules[__name__])

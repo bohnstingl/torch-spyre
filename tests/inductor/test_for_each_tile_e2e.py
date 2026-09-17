@@ -35,16 +35,33 @@ test_map_mode_split_m (map mode: Kind.SLICE + Kind.INVARIANT operands, a
 stacking carry, no user carry) passes end to end with verified numerics and
 is the case that exercises the full splice -> DimHint synthesis ->
 coarse-tile -> single scf.for pipeline.
+
+TestTripCountVariants then reuses the online-softmax fixture for a second
+question: with config.spyre_trip_count_variants on the count is left symbolic
+through the frontend and chosen at code generation, so one trace serves several
+trip counts -- does an armed count actually give that count's answer on device?
+The artifacts are pinned byte for byte in test_trip_count_symbolic.py; the device
+is the only oracle for what they compute. See the class docstring.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
+from torch._inductor.exc import InductorError
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
+from torch_spyre._inductor import config as spyre_config
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.execution.async_compile import SpyreAsyncCompile
+from torch_spyre.execution.trip_count import (
+    TripCountUnsetError,
+    precompile,
+    trip_count,
+)
 
 from tests.inductor.for_each_tile_fixtures import (
+    SOFTMAX_TILE_SIZE,
     attention_inputs,
     matmul_inputs,
     online_softmax_fn,
@@ -222,6 +239,228 @@ class TestForEachTileE2E(unittest.TestCase):
 
         # Same tolerance rationale as test_gather_mode_paged_pages above.
         torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
+
+
+class TestTripCountVariants(unittest.TestCase):
+    """One trace, several trip counts, chosen ambiently at launch.
+
+    With ``config.spyre_trip_count_variants`` on, the frontend leaves the count
+    symbolic (``_inductor/trip_count_symbol.py``) and each count is produced by
+    substituting it into the retained spec tree and re-emitting, instead of by
+    tracing again. The count then reaches the kernel through a thread-local the
+    caller arms, because it can travel neither in the call arguments nor in the
+    graph -- see ``execution/trip_count.py``.
+
+    Every count addresses the *maximum*'s buffers and only the loop bound moves,
+    so the caller hands the same max-size operands to all of them.
+    ``test_trip_count_symbolic.py`` pins that byte for byte on the artifacts,
+    which says nothing about what the device then does with them -- and that is
+    what these tests are for: running count ``k`` over max-size buffers has to
+    give exactly the answer for the first ``k`` tiles.
+    """
+
+    MAX_COUNT = 8
+    # Ascending, so the count the first artifact happens to be compiled for is
+    # the *smallest* one: with the count symbolic there is no base count to
+    # shrink from, and every later launch in the ladder grows past it.
+    COUNTS = (1, 2, 4, 8)
+    ATOL, RTOL = 0.1, 0.1
+
+    def _operands(self):
+        Q, K, V = attention_inputs(self.MAX_COUNT)
+        return (
+            (Q, K, V),
+            (Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME)),
+        )
+
+    @staticmethod
+    def _reference(host, count):
+        """The answer for ``count`` tiles: the reference on that KV prefix."""
+        Q, K, V = host
+        end = count * SOFTMAX_TILE_SIZE
+        return online_softmax_reference(Q, K[:end], V[:end])
+
+    @staticmethod
+    def _compile():
+        # Without the reset the second compile in a process hits Dynamo's code
+        # cache, so a knob flipped between compiles would not be read.
+        torch._dynamo.reset()
+        return torch.compile(online_softmax_fn, backend="inductor", fullgraph=True)
+
+    def test_ambient_count_selects_the_variant(self):
+        """Each armed count must give that count's answer, on shared buffers.
+
+        Two passes over the ladder, not one: the first builds each variant, the
+        second relaunches an already-prepared jobplan. A descriptor whose
+        per-iteration advance is not rewound between launches, or a carry left
+        holding the previous launch's state, is correct on the first launch and
+        wrong on the second -- so a single pass would not see it.
+        """
+        host, dev = self._operands()
+        refs = {k: self._reference(host, k) for k in self.COUNTS}
+
+        # Non-vacuity: the counts must have visibly different answers, or
+        # selecting the wrong variant would pass unnoticed.
+        spread = (refs[1] - refs[self.MAX_COUNT]).abs().max().item()
+        self.assertGreater(
+            spread,
+            10 * self.ATOL,
+            "the trip counts' answers are too close for this test to detect a "
+            "variant selected wrongly",
+        )
+
+        with spyre_config.patch(spyre_trip_count_variants=True):
+            compiled = self._compile()
+            for pass_no in (1, 2):
+                for count in self.COUNTS:
+                    with self.subTest(pass_no=pass_no, count=count):
+                        with trip_count(count):
+                            out = compiled(*dev)
+                        torch.testing.assert_close(
+                            out.cpu().float(),
+                            refs[count],
+                            atol=self.ATOL,
+                            rtol=self.RTOL,
+                        )
+
+    def test_a_count_larger_than_the_compiled_one(self):
+        """Growing past the first artifact's count is the point of the symbol.
+
+        Respecializing a *concrete* tree could only ever shrink, because its
+        descriptors were sized for the count it was traced at. A symbolic tree
+        was sized for the maximum and compiled for whichever count happened to
+        be armed first, so growth is ordinary -- and that is the observable
+        proof that the frontend really is count-agnostic rather than merely
+        re-emitting a count it had already seen.
+        """
+        host, dev = self._operands()
+        with spyre_config.patch(spyre_trip_count_variants=True):
+            compiled = self._compile()
+            with trip_count(2):
+                compiled(*dev)
+            with trip_count(self.MAX_COUNT):
+                out = compiled(*dev)
+        torch.testing.assert_close(
+            out.cpu().float(),
+            self._reference(host, self.MAX_COUNT),
+            atol=self.ATOL,
+            rtol=self.RTOL,
+        )
+
+    def test_the_frontend_runs_once_for_the_whole_ladder(self):
+        """The saving itself: N counts cost one frontend, not N.
+
+        Counted at ``SpyreAsyncCompile.sdsc`` -- the frontend's last step, and
+        the one call a variant does *not* go through, since ``build_variant``
+        re-emits from the retained tree straight into ``generate_bundle``. So a
+        count that re-traced would show up here as a second set of calls.
+        """
+        _, dev = self._operands()
+        calls: list[str] = []
+        real_sdsc = SpyreAsyncCompile.sdsc
+
+        def counting_sdsc(self, kernel_name, specs, pool_size=0):
+            calls.append(kernel_name)
+            return real_sdsc(self, kernel_name, specs, pool_size=pool_size)
+
+        with spyre_config.patch(spyre_trip_count_variants=True):
+            with patch.object(SpyreAsyncCompile, "sdsc", counting_sdsc):
+                compiled = self._compile()
+                with trip_count(self.COUNTS[0]):
+                    compiled(*dev)
+                after_first_launch = len(calls)
+                for count in self.COUNTS[1:]:
+                    with trip_count(count):
+                        compiled(*dev)
+
+        self.assertTrue(after_first_launch, "no kernel was compiled at all")
+        self.assertEqual(
+            len(calls),
+            after_first_launch,
+            f"the frontend ran again for a later count: {calls[after_first_launch:]}",
+        )
+
+    def test_unarmed_compile_raises(self):
+        """With nothing armed there is no count to compile *for*, so refuse.
+
+        Falling back to the maximum would hand back an artifact that runs every
+        iteration -- indistinguishable from a correct one until its output is
+        wrong -- to the one caller least likely to want it.
+
+        The refusal arrives wrapped, unlike the launch-side one below: it happens
+        while Inductor is executing the generated wrapper, so Inductor re-raises
+        it as its own ``InductorError``.
+        """
+        _, dev = self._operands()
+        with spyre_config.patch(spyre_trip_count_variants=True):
+            compiled = self._compile()
+            with self.assertRaises(InductorError) as caught:
+                compiled(*dev)
+        self.assertIsInstance(caught.exception.inner_exception, TripCountUnsetError)
+        self.assertIn("no trip count armed", str(caught.exception))
+
+    def test_unarmed_launch_raises(self):
+        """An already-compiled kernel must refuse an unarmed launch too.
+
+        A caller that passes max-size buffers and forgets the ``with`` would
+        otherwise silently run some earlier count over rows it never wrote,
+        which is a wrong answer with no error -- so the default is refusal, at
+        launch as much as at compile time.
+        """
+        _, dev = self._operands()
+        with spyre_config.patch(spyre_trip_count_variants=True):
+            compiled = self._compile()
+            with trip_count(2):
+                compiled(*dev)
+            with self.assertRaisesRegex(TripCountUnsetError, "no trip count"):
+                compiled(*dev)
+
+    def test_knob_off_ignores_the_ambient_count(self):
+        """Off, the count is inert: the traced kernel runs, armed or not.
+
+        Structural rather than a runtime branch: a knob-off trace bakes its
+        count, so the tree it retains has no symbolic count and the runner is
+        never variant-capable in the first place. That is what makes a stray
+        ``with trip_count(...)`` left in a host's dispatch path harmless.
+        """
+        host, dev = self._operands()
+        ref = self._reference(host, self.MAX_COUNT)
+        with spyre_config.patch(spyre_trip_count_variants=False):
+            compiled = self._compile()
+            with trip_count(1):
+                out = compiled(*dev)
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_precompile_reports_every_count(self):
+        """Warmup builds the ladder ahead of use, and reports what it did.
+
+        Failures come back as reports rather than exceptions on purpose -- an
+        unbuilt variant is compiled on first use, so warmup must not take down a
+        host that would otherwise run correctly, just slower.
+        """
+        _, dev = self._operands()
+        with spyre_config.patch(spyre_trip_count_variants=True):
+            compiled = self._compile()
+            # One launch first: the runner registers itself at construction,
+            # which happens when the generated wrapper is loaded.
+            with trip_count(self.MAX_COUNT):
+                compiled(*dev)
+
+            reports = precompile(self.COUNTS)
+            self.assertTrue(reports, "no variant-capable kernel was registered")
+            self.assertEqual(
+                [r for r in reports if r.status == "failed"],
+                [],
+                "\n".join(str(r) for r in reports),
+            )
+            for count in self.COUNTS:
+                self.assertIn(
+                    count,
+                    {r.count for r in reports},
+                    f"warmup skipped count {count}",
+                )
 
 
 if __name__ == "__main__":

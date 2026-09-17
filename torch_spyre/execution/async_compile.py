@@ -40,6 +40,7 @@ from torch_spyre._inductor.kernel_provenance import (
 from torch_spyre._inductor.codegen.bundle import generate_bundle
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE_BACKEND, try_collect
 from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
+from .trip_count import apply_ambient_count
 from .kernel_cache import (
     allocate_compile_dir,
     commit_compile_dir,
@@ -146,12 +147,18 @@ class _SpyreCompileFuture(CodeCacheFuture):
         compile_dir: str,
         kernel_provenance,
         cache_key: str | None = None,
+        specs: Sequence[Any] | None = None,
+        pool_size: int = 0,
+        base_count: int | None = None,
     ) -> None:
         self._task = task
         self._kernel_name = kernel_name
         self._compile_dir = compile_dir
         self._kernel_provenance = kernel_provenance
         self._cache_key = cache_key
+        self._specs = specs
+        self._pool_size = pool_size
+        self._base_count = base_count
         self._runner: SpyreSDSCKernelRunner | None = None
         self._failure_dir_moved = False
 
@@ -179,6 +186,9 @@ class _SpyreCompileFuture(CodeCacheFuture):
             self._kernel_name,
             code_dir,
             kernel_provenance=self._kernel_provenance,
+            specs=self._specs,
+            pool_size=self._pool_size,
+            base_count=self._base_count,
         )
         return self._runner
 
@@ -241,6 +251,9 @@ class SpyreAsyncCompile(AsyncCompile):
         compile_dir: str,
         kernel_provenance,
         cache_key: str | None = None,
+        specs: Sequence[Any] | None = None,
+        pool_size: int = 0,
+        base_count: int | None = None,
     ) -> _SpyreCompileFuture:
         future = _SpyreCompileFuture(
             task,
@@ -248,6 +261,9 @@ class SpyreAsyncCompile(AsyncCompile):
             compile_dir,
             kernel_provenance,
             cache_key=cache_key,
+            specs=specs,
+            pool_size=pool_size,
+            base_count=base_count,
         )
         self._pending_spyre_futures.append(future)
         return future
@@ -265,13 +281,30 @@ class SpyreAsyncCompile(AsyncCompile):
             )
             return SpyreUnimplementedRunner(kernel_name, unimp.op)
 
+        # This is the common fresh-compile/cache-reload boundary: generated
+        # wrappers have reconstructed the finalized OpSpecs before calling
+        # sdsc(). Derive the transport-neutral identity here without changing
+        # the generated wrapper call ABI. The same tree is what a variant-capable
+        # runner retains to re-emit at other trip counts.
+        finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
+
+        # A trip count left symbolic by the frontend becomes a number here, and
+        # only here: this is the one point both emitters (bundle and KTIR)
+        # receive the tree, and MLIR generation has no way to spell a symbol as a
+        # loop bound. Two trees exist from here on and the split is load-bearing:
+        #
+        #   compile_specs   this count only -- hashed, so the kernel cache keys
+        #                   per count, and emitted, so the bound is a constant.
+        #   finalized_specs still symbolic -- handed to the runner, which
+        #                   substitutes other counts into it without re-tracing.
+        #
+        # base_count says which count the artifact compiled below belongs to, so
+        # the runner can adopt it as that count's variant rather than treating it
+        # as a traced default (there is no traced count any more).
+        compile_specs, base_count = apply_ambient_count(finalized_specs)
+
         self._provenance_attempt_count += 1
         try:
-            # This is the common fresh-compile/cache-reload boundary: generated
-            # wrappers have reconstructed the finalized OpSpecs before calling
-            # sdsc(). Derive the transport-neutral identity here without changing
-            # the generated wrapper call ABI.
-            finalized_specs = cast(Sequence[OpSpec | LoopSpec], specs)
             kernel_provenance = build_kernel_provenance_descriptor(finalized_specs)
         except Exception:  # noqa: BLE001 - provenance must never fail the build
             # Keep canonicalization strict rather than issuing an ambiguous
@@ -298,7 +331,7 @@ class SpyreAsyncCompile(AsyncCompile):
             # neither generate_bundle nor dxp_standalone runs at all.
             try:
                 cache_key = compute_specs_hash(
-                    specs, kernel_name=kernel_name, pool_size=pool_size
+                    compile_specs, kernel_name=kernel_name, pool_size=pool_size
                 )
             except RuntimeError as e:
                 logger.warning(
@@ -315,7 +348,12 @@ class SpyreAsyncCompile(AsyncCompile):
                     logger.debug("Cache HIT: Using cached kernel from: %s", cached_dir)
                     get_kernel_registry().record_hit(cache_key)
                     return SpyreSDSCKernelRunner(
-                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance=kernel_provenance,
+                        specs=finalized_specs,
+                        pool_size=pool_size,
+                        base_count=base_count,
                     )
 
                 logger.debug("Cache MISS: Compiling kernel")
@@ -326,7 +364,7 @@ class SpyreAsyncCompile(AsyncCompile):
                 compile_dir: str = allocate_compile_dir(cache_key)
                 try:
                     generate_bundle(
-                        kernel_name, compile_dir, specs, pool_size=pool_size
+                        kernel_name, compile_dir, compile_specs, pool_size=pool_size
                     )
                     task = self._submit_dxp(kernel_name, compile_dir)
                     if task is not None:
@@ -336,11 +374,19 @@ class SpyreAsyncCompile(AsyncCompile):
                             compile_dir,
                             kernel_provenance,
                             cache_key=cache_key,
+                            specs=finalized_specs,
+                            pool_size=pool_size,
+                            base_count=base_count,
                         )
                     cached_dir = commit_compile_dir(compile_dir, cache_key)
                     logger.debug("Kernel compiled and cached at: %s", cached_dir)
                     return SpyreSDSCKernelRunner(
-                        kernel_name, cached_dir, kernel_provenance=kernel_provenance
+                        kernel_name,
+                        cached_dir,
+                        kernel_provenance=kernel_provenance,
+                        specs=finalized_specs,
+                        pool_size=pool_size,
+                        base_count=base_count,
                     )
                 except Exception:  # subprocess.CalledProcessError:
                     # Move the failed dir to failed/ for manual debugging
@@ -351,7 +397,7 @@ class SpyreAsyncCompile(AsyncCompile):
         # Caching disabled (SPYRE_KERNEL_CACHE=0 or force_disable_caches).
         # Compile into a throw-away temp dir that lives for this process only.
         output_dir = get_output_dir(kernel_name)
-        generate_bundle(kernel_name, output_dir, specs, pool_size=pool_size)
+        generate_bundle(kernel_name, output_dir, compile_specs, pool_size=pool_size)
         task = self._submit_dxp(kernel_name, output_dir)
         if task is not None:
             return self._compile_future(
@@ -359,11 +405,17 @@ class SpyreAsyncCompile(AsyncCompile):
                 kernel_name,
                 output_dir,
                 kernel_provenance,
+                specs=finalized_specs,
+                pool_size=pool_size,
+                base_count=base_count,
             )
         return SpyreSDSCKernelRunner(
             kernel_name,
             output_dir,
             kernel_provenance=kernel_provenance,
+            specs=finalized_specs,
+            pool_size=pool_size,
+            base_count=base_count,
         )
 
     def ktir(
