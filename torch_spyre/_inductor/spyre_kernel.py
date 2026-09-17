@@ -87,6 +87,7 @@ from .op_spec import (
     is_lx_relayout_identity,
 )
 from .op_spec_validation import validate_op_specs
+from .trip_count_symbol import is_symbolic_count
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
@@ -1543,6 +1544,21 @@ def uses_hbm_pool(specs) -> bool:
     )
 
 
+def _count_source(count, sympy_str) -> str:
+    """Python source that reconstructs a ``LoopSpec.count`` on wrapper reload.
+
+    A ``TripCountSymbol`` needs its own call rather than ``sympy_str``'s
+    ``sympify('_trip_0_8')``: sympify would rebuild it as a plain ``Symbol``,
+    silently dropping the class the codegen seam dispatches on and the maximum
+    substitution validates against. The reconstructed symbol is the *same
+    object* as the original -- sympy interns by name -- so a spec tree loaded
+    from the wrapper cache substitutes exactly like a freshly traced one.
+    """
+    if is_symbolic_count(count):
+        return f"trip_count_symbol({count.loop_id}, {count.max_value})"
+    return sympy_str(count)
+
+
 def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
     """Emit Python source for a list of OpSpec / UnimplementedOp / LoopSpec entries."""
     for op_spec in specs:
@@ -1551,7 +1567,7 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 logger.debug(f"op_spec: LoopSpec(count={op_spec.count})")
             buf.writeline("LoopSpec(")
             with buf.indent():
-                buf.writeline(f"count={sympy_str(op_spec.count)},")
+                buf.writeline(f"count={_count_source(op_spec.count, sympy_str)},")
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)

@@ -59,6 +59,8 @@ def _restickify_dep_index(
     """Resolve a restickify plan entry to its exact read-metadata slot."""
     old_name = restick_arg_info["arg_name"]
     if "dep_index" not in restick_arg_info:
+        # Legacy entries are created directly by enforce_indirect_access_layout;
+        # the normal restickify plan always records dep_index and occurrence.
         matches = [i for i, dep in enumerate(memory_deps) if dep.name == old_name]
         if len(matches) > 1:
             raise AssertionError(

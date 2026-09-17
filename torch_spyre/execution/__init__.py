@@ -13,3 +13,10 @@
 # limitations under the License.
 
 from .kernel_cache import get_kernel_registry  # noqa: F401
+from .trip_count import (  # noqa: F401
+    TripCountUnsetError,
+    VariantReport,
+    current_trip_count,
+    precompile,
+    trip_count,
+)

@@ -60,6 +60,8 @@ import torch
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
 
+from .. import config
+
 if TYPE_CHECKING:
     from torch._inductor import ir
     from torch._inductor.dependencies import Dep
@@ -1270,9 +1272,20 @@ def splice_while_loops(graph) -> None:
                 group_ops, loop_var, hint_id, result.trip_count
             )
 
+            # Both the hint range above and `levels` here stay the *literal*
+            # trip count even when the bound is left to code generation: they
+            # are advance multipliers and buffer-sizing terms (see
+            # coarse_tile.py's _loop_var_hinted_ranges), i.e. exactly the
+            # consumers that must see the traced maximum. The flag below is the
+            # whole of what "symbolic" means at this level -- see
+            # trip_count_symbol.py for why the count is minted at the scheduler
+            # boundary rather than carried from here.
             levels = [(hint_id, result.trip_count)]
             coarse_tile_pre_stickify(
-                graph, groups=[(group_ops, levels)], group_idx_offset=group_idx
+                graph,
+                groups=[(group_ops, levels)],
+                group_idx_offset=group_idx,
+                symbolic_trip_count=config.spyre_trip_count_variants,
             )
 
             group_idx += 1

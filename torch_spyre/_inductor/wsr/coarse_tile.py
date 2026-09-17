@@ -1658,6 +1658,7 @@ def _point_splice_advance_for_dep(
     for hint_id, _count in levels:
         loop_var = unattributed_loop_vars.get(hint_id)
         coeff = coefficients.get(loop_var, sympy.S.Zero)
+        # The point read is one element; coeff already gives its per-trip stride.
         result.append([(coeff, sympy.Integer(1))] if coeff != 0 else [])
     return result
 
@@ -2864,6 +2865,7 @@ def _apply_plan(
     levels: list[tuple],
     op_to_position: dict[str, int],
     plan: dict[int, CoarseTileInfo],
+    symbolic_trip_count: bool = False,
 ) -> dict[str, _RetiledBufferInfo]:
     """Apply planning's decisions: divide ranges and stamp loop_info.
 
@@ -2882,6 +2884,12 @@ def _apply_plan(
     offset). This function overwrites loop_group_id with the caller's real
     value via dataclasses.replace before stamping, so the offset is never
     lost. Every other field of `info` is planning's decision, unchanged.
+
+    `symbolic_trip_count` is stamped through the same replace. It does not
+    change anything this function does -- the ranges are still divided by the
+    literal `count` from `levels` -- it only records, for scheduler.py's
+    `_loop_count`, that this group's MLIR loop bound is chosen at code
+    generation rather than here. See trip_count_symbol.py.
     """
     if not ops:
         return {}
@@ -2920,7 +2928,9 @@ def _apply_plan(
                 _apply_work_div_symbol_remap(op, reduction_remap)
 
         op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
-            info, loop_group_id=stamped_group_id
+            info,
+            loop_group_id=stamped_group_id,
+            symbolic_trip_count=symbolic_trip_count,
         )
 
         logger.debug(
@@ -2936,6 +2946,7 @@ def coarse_tile_pre_stickify(
     graph: GraphLowering,
     groups: list[tuple],
     group_idx_offset: int = 0,
+    symbolic_trip_count: bool = False,
 ) -> None:
     """Hint-driven coarse tiling.  Runs PRE-stickification.
 
@@ -2953,12 +2964,25 @@ def coarse_tile_pre_stickify(
         Starting index for group IDs assigned to the first group.  Use this
         when making a second call on the same graph so that the new group
         IDs do not collide with IDs already stamped by an earlier call.
+    symbolic_trip_count:
+        Record on every stamped ``CoarseTileInfo`` that this call's loop bound
+        is chosen at code generation, not here.  The ``levels`` counts are
+        still the literal maximum and are still what the ranges are divided
+        by; only ``LoopSpec.count`` ends up symbolic.  Set by the
+        ``for_each_tile`` splice pass under
+        ``config.spyre_trip_count_variants``; see ``trip_count_symbol.py``.
 
     Plans and inserts read copy-ins (Pass 1), reduction machinery (Pass 2),
     and write copy-outs (Pass 3). See coarse_tile_post_stickify for the
     post-stickification counterpart, which never needs Pass 1.
     """
-    _coarse_tile_common(graph, groups, group_idx_offset, run_read_copies=True)
+    _coarse_tile_common(
+        graph,
+        groups,
+        group_idx_offset,
+        run_read_copies=True,
+        symbolic_trip_count=symbolic_trip_count,
+    )
 
 
 def coarse_tile_post_stickify(
@@ -2997,6 +3021,7 @@ def _coarse_tile_common(
     groups: list[tuple],
     group_idx_offset: int,
     run_read_copies: bool,
+    symbolic_trip_count: bool = False,
 ) -> None:
     """Plan then transform: stamp loop_group_id / loop_count and scale ranges.
 
@@ -3042,7 +3067,12 @@ def _coarse_tile_common(
         op_to_position = {op.get_operation_name(): i for i, op in enumerate(operations)}
         stamped_group_id = group_id + (0,) * (len(levels) - 1)
         retiled_infos = _apply_plan(
-            group_ops, stamped_group_id, levels, op_to_position, plan
+            group_ops,
+            stamped_group_id,
+            levels,
+            op_to_position,
+            plan,
+            symbolic_trip_count=symbolic_trip_count,
         )
         retiled_infos_by_group.append((stamped_group_id, group_ops, retiled_infos))
 
@@ -6463,9 +6493,15 @@ def _propagate_tiled_reduction_op(
         # op.loop_info's now-real loop_group_id so the fill/copy ops this
         # function stamps with fill_loop_info end up in the same outer group
         # as every other op here, not a stale, potentially colliding one.
+        # symbolic_trip_count is inherited for the same reason and must be:
+        # scheduler.py's _loop_count mints a symbolic count only for ops
+        # carrying the flag, and asserts every node in a loop group reports the
+        # same count -- so a fill op left at the default would make that assert
+        # fire (loudly, not silently) for a symbolic group.
         fill_loop_info = dataclasses.replace(
             fill_loop_info,
             loop_group_id=loop_group_id[: len(fill_loop_info.loop_count)],
+            symbolic_trip_count=loop_info.symbolic_trip_count,
         )
 
     if is_nested:

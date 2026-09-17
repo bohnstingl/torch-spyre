@@ -643,11 +643,20 @@ LQ, LK, D = 128, 256, 128
 SOFTMAX_TILE_SIZE = 128
 
 
-def attention_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def attention_inputs(
+    num_tiles: int = LK // SOFTMAX_TILE_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q whole plus ``num_tiles`` KV tiles, i.e. a trip count of ``num_tiles``.
+
+    The count is the KV length, so asking for a different one is how a caller
+    asks ``online_softmax_fn`` for a different trip count. ``online_softmax_
+    reference`` takes whatever K/V it is given, so the count-``k`` answer is
+    just the reference on the first ``k`` tiles of these same operands.
+    """
     torch.manual_seed(0)
     Q = torch.randn(LQ, D, dtype=torch.float16)
-    K = torch.randn(LK, D, dtype=torch.float16)
-    V = torch.randn(LK, D, dtype=torch.float16)
+    K = torch.randn(num_tiles * SOFTMAX_TILE_SIZE, D, dtype=torch.float16)
+    V = torch.randn(num_tiles * SOFTMAX_TILE_SIZE, D, dtype=torch.float16)
     return Q, K, V
 
 

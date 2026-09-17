@@ -43,6 +43,7 @@ from .scratchpad.lx_relayout import (
     materialized_lx_relayout_for_destination,
 )
 from .op_spec import LoopSpec
+from .trip_count_symbol import trip_count_symbol
 from . import config as _spyre_config
 from .errors import Unsupported
 
@@ -105,6 +106,33 @@ def _loop_group_id(node: BaseSchedulerNode):
     return None
 
 
+def _symbolic_loop_count(gid: tuple[int, ...], counts: list, depth: int) -> sympy.Expr:
+    """The trip-count symbol for a loop whose bound codegen chooses.
+
+    The symbol's identity is the outer group index, so a kernel with several
+    spliced loops gets one symbol per loop and
+    ``trip_count_symbol.substitute_trip_counts`` can give each its own count.
+    That identity only distinguishes *groups*, so a multi-level group would make
+    two nesting depths share one symbol and one substituted count. Rather than
+    invent an encoding for a shape no producer creates -- ``for_each_tile``
+    splices exactly one level per group -- this raises.
+    """
+    if len(counts) != 1:
+        raise AssertionError(
+            f"symbolic trip count is only supported for a single-level loop "
+            f"group, got loop_group_id={gid} with {len(counts)} levels"
+        )
+    max_value = counts[depth]
+    if not (isinstance(max_value, sympy.Expr) and max_value.is_Integer) and not (
+        isinstance(max_value, int) and not isinstance(max_value, bool)
+    ):
+        raise AssertionError(
+            f"a symbolic trip count needs a literal maximum to be traced at, "
+            f"got loop_count[{depth}]={max_value!r} for loop_group_id={gid}"
+        )
+    return trip_count_symbol(gid[0], int(max_value))
+
+
 def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     """Return the loop_count for ``depth`` from the ir.Operation inside node.
 
@@ -116,6 +144,16 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
     For a flat (depth-1) op, ``loop_count = [K]`` and only depth 0 is valid.
     For a nested op with ``loop_group_id = (g, 0)``, ``loop_count = [K1, K2]``
     and depth 0 → K1, depth 1 → K2.
+
+    When ``loop_info.symbolic_trip_count`` is set, this is the one place that
+    turns the literal count into a symbol, so that the MLIR loop bound is chosen
+    at code generation and one frontend trace serves every count. It is the only
+    such place because it is the only reader whose value reaches
+    ``LoopSpec.count`` (via ``GroupedSchedulerNode.loop_count``); everything else
+    reads ``loop_info.loop_count``, which stays literal. Minting is a pure
+    function of ``(group id, literal count)``, so every node in a loop group
+    yields the identical symbol and the ``next_count == count`` check below still
+    compares equal. See ``trip_count_symbol.py``.
     """
     for snode in node.get_nodes():
         if isinstance(snode, SchedulerNode) and snode.node is not None:
@@ -129,6 +167,8 @@ def _loop_count(node: BaseSchedulerNode, depth: int) -> sympy.Expr:
                     f"loop_count length {len(counts)} != loop_group_id depth {len(gid)}"
                 )
                 if 0 <= depth < len(counts):
+                    if getattr(loop_info, "symbolic_trip_count", False):
+                        return _symbolic_loop_count(gid, counts, depth)
                     return counts[depth]
     raise AssertionError(f"Node {node.get_name()} has no loop_count for depth {depth}")
 

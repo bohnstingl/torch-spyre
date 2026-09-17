@@ -295,6 +295,8 @@ class CoarseTileInfo:
     loop_count:
         List of trip counts, one per nesting level from outermost to
         innermost.  ``len(loop_count) == len(loop_group_id)`` always holds.
+        Always **literal**, even when ``symbolic_trip_count`` is set -- see
+        that field.
     loop_tiled_dims:
         List of lists, one sub-list per nesting level.  Each sub-list
         contains the ``data.ranges`` positional indices that are tiled at
@@ -369,6 +371,15 @@ class CoarseTileInfo:
         Planned decision for how this op's result crosses its loop
         boundary, computed by ``_plan_tiling_propagation``. ``None`` until
         that planning stage runs (or for ops it doesn't cover).
+    symbolic_trip_count:
+        Whether this loop's trip count is only fixed at code generation, so
+        that one frontend trace serves every count (``for_each_tile`` under
+        ``config.spyre_trip_count_variants``).  ``loop_count`` still holds the
+        literal *maximum* the trace was made at, which is what every consumer
+        that sizes or addresses a buffer must see; the symbol exists only in
+        ``LoopSpec.count`` and is minted from this flag by ``scheduler.py``'s
+        ``_loop_count``.  See ``trip_count_symbol.py`` for why the split lives
+        here rather than in ``loop_count`` itself.
     """
 
     loop_group_id: tuple[int, ...]
@@ -386,6 +397,7 @@ class CoarseTileInfo:
         default_factory=list
     )
     propagation: "PropagationPlan | None" = None
+    symbolic_trip_count: bool = False
 
 
 # ---------------------------------------------------------------------------

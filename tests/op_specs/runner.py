@@ -217,6 +217,7 @@ import torch
 from torch_spyre._C import DataFormats, SpyreTensorLayout
 from torch_spyre._inductor import config as spyre_config
 from torch_spyre._inductor.codegen.bundle import generate_bundle
+from torch_spyre._inductor.trip_count_symbol import trip_count_symbol
 from torch_spyre.execution.async_compile import SpyreAsyncCompile
 """
 
