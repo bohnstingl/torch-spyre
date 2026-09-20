@@ -1324,9 +1324,10 @@ def splice_while_loops(graph) -> None:
         for while_op in while_ops:
             name = getattr(while_op, "get_name", lambda: repr(while_op))()
             result = try_prove_for_each_tile(while_op)
-            if not result.accepted:
+            if not result.accepted or result.trip_count is None:
                 declined.append(f"{name}: {result.reason}")
                 continue
+            trip_count = result.trip_count
 
             loop_var = _body_loop_var(while_op)
             if loop_var is None:
@@ -1337,39 +1338,35 @@ def splice_while_loops(graph) -> None:
                 continue
 
             stacking = _stacking_carry_indices(while_op, loop_var)
-            if stacking and result.trip_count.free_symbols:
+            if stacking and trip_count.free_symbols:
                 # The stacked output's layout is planned from the trip count, so
                 # a symbolic one would size it from the planning extent while a
                 # smaller runtime count writes only a prefix, leaving the tail
                 # uninitialized. Map mode with a concrete count is unaffected.
                 declined.append(
-                    f"{name}: trip count {result.trip_count} is symbolic and this "
+                    f"{name}: trip count {trip_count} is symbolic and this "
                     f"loop stacks its output through carries {sorted(stacking)}"
                 )
                 continue
 
             carries = carry_bindings_for(while_op, stacking)
             group_ops = splice_while_loop(
-                graph, while_op, carries, trip_count=result.trip_count
+                graph, while_op, carries, trip_count=trip_count
             )
 
             _consume_tile_dim_markers(group_ops, graph.operations)
 
-            _synthesize_dim_hints_for_group(
-                group_ops, loop_var, hint_id, result.trip_count
-            )
+            _synthesize_dim_hints_for_group(group_ops, loop_var, hint_id, trip_count)
 
             from torch_spyre._inductor.pass_utils import compute_max_size
 
-            planning_count = sympy.Integer(compute_max_size(result.trip_count))
+            planning_count = sympy.Integer(compute_max_size(trip_count))
             levels = [(hint_id, planning_count)]
             coarse_tile_pre_stickify(
                 graph,
                 groups=[(group_ops, levels)],
                 group_idx_offset=group_idx,
-                runtime_loop_count=(
-                    result.trip_count if result.trip_count.free_symbols else None
-                ),
+                runtime_loop_count=(trip_count if trip_count.free_symbols else None),
             )
 
             group_idx += 1
