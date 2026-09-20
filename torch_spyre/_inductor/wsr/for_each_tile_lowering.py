@@ -59,6 +59,9 @@ import torch
 
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
 from torch._inductor.virtualized import V
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
+
+from torch_spyre._inductor.pass_utils import finite_upper_or_none
 
 if TYPE_CHECKING:
     from torch._inductor import ir
@@ -174,6 +177,54 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     return sympy.sympify(bound)
 
 
+def _trip_count_decline_reason(trip_count: sympy.Expr) -> str | None:
+    """Why ``trip_count`` cannot drive a counted loop, or None if it can.
+
+    A symbolic count has to be bounded at trace time in both directions. The
+    upper bound becomes the loop's planning extent and therefore its memory
+    geometry (``compute_max_size`` -> ``LoopSpec.max_count``), so a bound
+    guessed by ``optimization_hint`` would hand the runtime a count with
+    nowhere to write; it must come from ``mark_dynamic(max=...)``. The lower
+    bound has to reach 1, because a specialized variant runs its body at least
+    once. An unbacked symbol has no range at all and so is never usable.
+
+    Args:
+        trip_count: The bound recovered from the loop's cond subgraph.
+
+    Returns:
+        A reason string to decline with, or None when the count is usable.
+    """
+    if not trip_count.free_symbols:
+        if trip_count < 1:
+            return f"concrete trip count {trip_count} is not positive"
+        return None
+
+    unbacked = free_unbacked_symbols(trip_count)
+    if unbacked:
+        return (
+            f"trip count {trip_count} depends on unbacked symbols "
+            f"{sorted(map(str, unbacked))}, which carry no trace-time range"
+        )
+
+    sizevars = getattr(V.graph, "sizevars", None)
+    shape_env = getattr(sizevars, "shape_env", None)
+    if shape_env is None:
+        return f"trip count {trip_count} is symbolic but no ShapeEnv is available"
+    if finite_upper_or_none(trip_count) is None:
+        return (
+            f"trip count {trip_count} has no finite ShapeEnv upper bound; mark the "
+            "tiled dimension with torch._dynamo.mark_dynamic(t, dim, max=N) so the "
+            "loop's planning extent is declared rather than guessed"
+        )
+    lower = shape_env.bound_sympy(trip_count).lower
+    if not (isinstance(lower, sympy.Integer) and int(lower) >= 1):
+        return (
+            f"trip count {trip_count} is not provably >= 1 (lower bound {lower}); "
+            "a specialized loop variant always runs its body at least once"
+        )
+    return None
+
+
 def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
     """Decide whether while_op matches for_each_tile's known WhileLoop shape."""
     cond_subgraph = getattr(while_op, "cond_subgraph", None)
@@ -190,6 +241,9 @@ def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
                 "lt(iteration_sym, N) comparison"
             ),
         )
+    reason = _trip_count_decline_reason(trip_count)
+    if reason is not None:
+        return ProverResult(accepted=False, reason=reason)
     return ProverResult(accepted=True, trip_count=trip_count)
 
 
@@ -1237,9 +1291,17 @@ def splice_while_loops(graph) -> None:
     propagate_named_dims/assign_dim_hints ever run for this compile -- since
     those overwrite op.dim_hints from scratch and would otherwise silently
     clobber the synthesized hints this function just stamped.
+
+    Raises:
+        Unsupported: A WhileLoop survived to the fixed point. No later pass
+            handles one -- propagate_layouts, work_division and
+            propagate_named_dims each log "unhandled node type" and skip it,
+            so the loop's writes never happen and the kernel returns whatever
+            was in its output buffer. The decline reason is reported instead.
     """
     from torch._inductor import ir
 
+    from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.wsr.coarse_tile import coarse_tile_pre_stickify
     from torch_spyre._inductor.wsr.while_loop_bridge import (
         carry_bindings_for,
@@ -1250,23 +1312,43 @@ def splice_while_loops(graph) -> None:
     group_idx = 0
 
     while True:
+        # Reset per sweep: only the loops still declined once no further splice
+        # makes progress are unhandled. An inner loop of a nested for_each_tile
+        # is not even visible until its outer loop has been spliced.
+        declined: list[str] = []
         while_ops = [op for op in graph.operations if isinstance(op, ir.WhileLoop)]
         if not while_ops:
             break
 
         progressed = False
         for while_op in while_ops:
+            name = getattr(while_op, "get_name", lambda: repr(while_op))()
             result = try_prove_for_each_tile(while_op)
             if not result.accepted:
-                continue  # leave untouched; falls through to upstream's default path
+                declined.append(f"{name}: {result.reason}")
+                continue
 
             loop_var = _body_loop_var(while_op)
             if loop_var is None:
-                continue  # body shape doesn't match; leave untouched
+                declined.append(
+                    f"{name}: body subgraph has no DynamicScalar reading the trip "
+                    "counter, so there is no per-iteration index symbol to tile on"
+                )
+                continue
 
-            carries = carry_bindings_for(
-                while_op, _stacking_carry_indices(while_op, loop_var)
-            )
+            stacking = _stacking_carry_indices(while_op, loop_var)
+            if stacking and result.trip_count.free_symbols:
+                # The stacked output's layout is planned from the trip count, so
+                # a symbolic one would size it from the planning extent while a
+                # smaller runtime count writes only a prefix, leaving the tail
+                # uninitialized. Map mode with a concrete count is unaffected.
+                declined.append(
+                    f"{name}: trip count {result.trip_count} is symbolic and this "
+                    f"loop stacks its output through carries {sorted(stacking)}"
+                )
+                continue
+
+            carries = carry_bindings_for(while_op, stacking)
             group_ops = splice_while_loop(
                 graph, while_op, carries, trip_count=result.trip_count
             )
@@ -1297,3 +1379,9 @@ def splice_while_loops(graph) -> None:
         if not progressed:
             # Every remaining WhileLoop was declined; stop rather than loop forever.
             break
+
+    if declined:
+        raise Unsupported(
+            "a while_loop this backend cannot lower to a counted loop: "
+            + "; ".join(declined)
+        )

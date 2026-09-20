@@ -92,6 +92,12 @@ class SpyreSDSCKernelRunner:
 
     @property
     def jobplan(self):
+        if self._specs is not None:
+            raise RuntimeError(
+                f"{self.kernel_name} has a symbolic loop count and no jobplan of "
+                "its own; launch it as run(..., loop_count=n) so the variant for "
+                "n is compiled, and take that runner's jobplan"
+            )
         if self.code_dir is None:
             raise RuntimeError(f"{self.kernel_name} has no concrete code directory")
         if self._jobplan is None:
@@ -176,6 +182,14 @@ class SpyreSDSCKernelRunner:
         loop_count: int | None = None,
         **kw_args,
     ):
+        if kw_args:
+            # Launch arguments are positional and index-bound to the op specs, so
+            # a keyword that lands here is a wrapper/runner mismatch. Silently
+            # ignoring it would drop a real argument on the floor.
+            raise TypeError(
+                f"{self.kernel_name}.run() got unexpected keyword arguments: "
+                f"{', '.join(sorted(kw_args))}"
+            )
         if self._specs is not None:
             if loop_count is None:
                 raise TypeError(f"{self.kernel_name}.run() requires loop_count=")

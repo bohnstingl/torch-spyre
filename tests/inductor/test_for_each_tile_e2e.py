@@ -38,13 +38,16 @@ coarse-tile -> single scf.for pipeline.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre.execution import async_compile as async_compile_mod
 
 from tests.inductor.for_each_tile_fixtures import (
+    PAGE_BLOCKS,
     attention_inputs,
     matmul_inputs,
     online_softmax_fn,
@@ -80,6 +83,14 @@ class TestForEachTileE2E(unittest.TestCase):
     # near zero).
     ATOL = 0.1
     RTOL = 0.1
+
+    def setUp(self):
+        # Order independence, not hygiene for its own sake: two tests here compile
+        # the same fixture at different table heights, and a leftover cache entry
+        # lets automatic-dynamic promote the block axis to a symbol with no
+        # declared max -- which a counted loop must decline (TS-5), so the second
+        # test fails on the first one's state.
+        torch._dynamo.reset()
 
     @staticmethod
     def _operands():
@@ -222,6 +233,75 @@ class TestForEachTileE2E(unittest.TestCase):
 
         # Same tolerance rationale as test_gather_mode_paged_pages above.
         torch.testing.assert_close(out.cpu().float(), ref, atol=2.0, rtol=0.05)
+
+    def test_symbolic_count_matches_a_statically_traced_count(self):
+        """A dynamic-count walk at k trips equals the kernel traced for exactly k.
+
+        The SymInt contract in one assertion. The count reaches the backend as a
+        single ``loop_count=`` argument and is substituted into the specialized
+        specs; a count replaced in one place but not another, or a buffer sized
+        from the planning extent rather than the count, both still compile and
+        both change the numbers. Counts start at 2 because Dynamo specializes a
+        dimension whose value is 1.
+        """
+        pages, _, q = paged_gather_inputs()
+        pages_spyre = pages.to(DEVICE_NAME)
+        q_spyre = q.to(DEVICE_NAME)
+        counts = (2, 3, PAGE_BLOCKS)
+        tables = {count: paged_gather_inputs(count)[1] for count in counts}
+
+        dynamic = torch.compile(paged_gather_fn, backend="inductor", fullgraph=True)
+        walked = {}
+        for count in counts:
+            table = tables[count].to(DEVICE_NAME)
+            torch._dynamo.mark_dynamic(table, 0, min=2, max=PAGE_BLOCKS)
+            walked[count] = dynamic(pages_spyre, table, q_spyre).cpu().float()
+
+        # Reset first, or the static compiles below satisfy the dynamic entry's
+        # guards and reuse it -- the comparison would then be the symbolic result
+        # against itself. dynamic=False keeps the third shape specialized rather
+        # than promoted by automatic-dynamic after two recompiles.
+        torch._dynamo.reset()
+        static = torch.compile(
+            paged_gather_fn, backend="inductor", fullgraph=True, dynamic=False
+        )
+        for count in counts:
+            expected = static(pages_spyre, tables[count].to(DEVICE_NAME), q_spyre)
+            torch.testing.assert_close(
+                walked[count], expected.cpu().float(), atol=1e-2, rtol=1e-3
+            )
+
+    def test_a_count_beyond_the_traced_maximum_is_rejected(self):
+        """``max_count`` is a hard bound, and a real compile carries the real one.
+
+        Every buffer the loop writes is planned for ``max_count`` trips, so a
+        larger count would walk past the end of them. The unit-level check in
+        tests/test_async_compile.py hand-builds ``max_count``; this one asks the
+        runner an actual compile produced, which is the value that has to be
+        right.
+        """
+        pages, table, q = paged_gather_inputs(2)
+        created = []
+        build_runner = async_compile_mod.SpyreSDSCKernelRunner
+
+        def record(*args, **kwargs):
+            runner = build_runner(*args, **kwargs)
+            created.append(runner)
+            return runner
+
+        table_spyre = table.to(DEVICE_NAME)
+        torch._dynamo.mark_dynamic(table_spyre, 0, min=2, max=PAGE_BLOCKS)
+        with patch.object(async_compile_mod, "SpyreSDSCKernelRunner", new=record):
+            compiled = torch.compile(
+                paged_gather_fn, backend="inductor", fullgraph=True
+            )
+            compiled(pages.to(DEVICE_NAME), table_spyre, q.to(DEVICE_NAME))
+
+        symbolic = [runner for runner in created if runner._specs is not None]
+        self.assertTrue(symbolic, "the walk compiled without a symbolic runner")
+        for runner in symbolic:
+            with self.assertRaisesRegex(ValueError, "exceeds traced maximum"):
+                runner._variant_runner(PAGE_BLOCKS + 1)
 
 
 if __name__ == "__main__":
