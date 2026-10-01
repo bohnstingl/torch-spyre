@@ -213,8 +213,16 @@ def _movedim(t: torch.Tensor, src: int, dst: int) -> torch.Tensor:
     return t if src == dst else torch.movedim(t, src, dst)
 
 
-def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
-    """The scan `xs` leaf for one operand: [num_tiles, ...], scanned along dim 0."""
+def _xs_leaf(operand: torch.Tensor, spec: TileSpec, num_tiles: int) -> torch.Tensor:
+    """The scan `xs` leaf for one operand: [num_tiles, ...], scanned along dim 0.
+
+    An INVARIANT operand is a stride-0 broadcast whose every step is the whole
+    operand, not a closure over the body: `scan` lifts closures as inputs with their
+    real storage and rejects two that alias -- e.g. K and V split from one fused QKV
+    projection -- while every `xs` slice reaches the body as a fresh copy.
+    """
+    if spec.kind is Kind.INVARIANT:
+        return operand.unsqueeze(0).expand(num_tiles, *operand.shape)
     if spec.kind is Kind.GATHER:
         if spec.index is None:
             raise AssertionError("GATHER spec without an index table")
@@ -232,6 +240,8 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
     """Turn scan's step slice of the xs leaf back into the operand's own layout."""
+    if spec.kind is Kind.INVARIANT:
+        return sliced
     if spec.kind is Kind.GATHER:
         tile = operand.index_select(spec.dim, sliced.reshape(1))
     else:
@@ -336,9 +346,7 @@ def for_each_tile(
     if count_mode:
         scan_init = (_step_counter(init_leaves[0]), init)
 
-    xs = tuple(
-        _xs_leaf(o, s) for o, s in zip(operands, specs) if s.kind is not Kind.INVARIANT
-    )
+    xs = tuple(_xs_leaf(o, s, num_tiles) for o, s in zip(operands, specs))
 
     def combine_fn(carry, sliced):
         # In map mode, the step counter is the whole carry.
@@ -346,11 +354,7 @@ def for_each_tile(
             step, carry = carry
         elif map_mode:
             step, carry = carry, None
-        it = iter(sliced)
-        tiles = tuple(
-            o if s.kind is Kind.INVARIANT else _tile(o, s, next(it))
-            for o, s in zip(operands, specs)
-        )
+        tiles = tuple(_tile(o, s, t) for o, s, t in zip(operands, specs, sliced))
         next_carry, y = body(carry, tiles)
         if map_mode:
             next_carry = step + 1

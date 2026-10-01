@@ -1067,5 +1067,39 @@ class TestForEachTileLowering(unittest.TestCase):
         )
 
 
+class TestForEachTileAliasedInvariants(unittest.TestCase):
+    def test_views_of_one_storage(self):
+        """K and V split from one fused tensor are both INVARIANT operands.
+
+        As body closures `scan` would reject them as two inputs aliasing one storage,
+        both when a decomposition traces them (make_fx over fake tensors) and when
+        dynamo traces the caller.
+        """
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def fn(x, kv):
+            k, v = kv.split(4, dim=-1)
+
+            def body(_, tiles):
+                x_tile, k_tile, v_tile = tiles
+                return None, x_tile @ k_tile.T @ v_tile
+
+            _, out = for_each_tile(
+                body, (x, k, v), dims=(0, None, None), tile_size=2, out_dim=0
+            )
+            return out
+
+        x, kv = torch.randn(8, 4), torch.randn(6, 8)
+        k, v = kv.split(4, dim=-1)
+        traced = {
+            "make_fx": lambda *a: make_fx(fn, tracing_mode="fake")(*a)(*a),
+            "torch.compile": torch.compile(fn, backend="inductor", fullgraph=True),
+        }
+        for name, trace in traced.items():
+            with self.subTest(name):
+                torch._dynamo.reset()
+                torch.testing.assert_close(trace(x, kv), x @ k.T @ v)
+
+
 if __name__ == "__main__":
     unittest.main()
