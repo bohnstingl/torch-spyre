@@ -1067,5 +1067,78 @@ class TestForEachTileLowering(unittest.TestCase):
         )
 
 
+class TestScanInputAliasing(unittest.TestCase):
+    """torch_spyre's scan patch (#4893): read-only loop inputs may share a storage."""
+
+    def setUp(self):
+        torch._dynamo.reset()
+        self.x, self.kv = torch.randn(8, 4), torch.randn(6, 8)
+
+    def test_views_of_one_storage_as_invariant_operands(self):
+        """K and V split from one tensor, both captured whole by the loop."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def fn(x, kv):
+            k, v = kv.split(4, dim=-1)
+
+            def body(_, tiles):
+                x_tile, k_tile, v_tile = tiles
+                return None, x_tile @ k_tile.T @ v_tile
+
+            _, out = for_each_tile(
+                body, (x, k, v), dims=(0, None, None), tile_size=2, out_dim=0
+            )
+            return out
+
+        k, v = self.kv.split(4, dim=-1)
+        traced = {
+            "make_fx": lambda *a: make_fx(fn, tracing_mode="fake")(*a)(*a),
+            "torch.compile": torch.compile(fn, backend="inductor", fullgraph=True),
+        }
+        for name, trace in traced.items():
+            with self.subTest(name):
+                torch._dynamo.reset()
+                torch.testing.assert_close(trace(self.x, self.kv), self.x @ k.T @ v)
+
+    def _scan_over_kv(self, body, init=None):
+        from torch._higher_order_ops.scan import scan
+
+        def fn(x, kv):
+            k, v = kv.split(4, dim=-1)
+            carry = torch.zeros(()) if init is None else init(k, v)
+            return scan(
+                lambda c, x_t: body(c, x_t, k, v), carry, x.unflatten(0, (4, 2))
+            )
+
+        return torch.compile(fn, backend="inductor", fullgraph=True)
+
+    def test_aliased_inputs_requiring_grad_are_rejected(self):
+        fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, x_t @ k.T @ v))
+        with self.assertRaisesRegex(Exception, "Input-to-input aliasing"):
+            fn(self.x, self.kv.clone().requires_grad_())
+
+    def test_mutating_an_aliased_input_is_rejected(self):
+        def body(c, x_t, k, v):
+            k.add_(1.0)
+            return c + 1, x_t @ v.T
+
+        with self.assertRaisesRegex(Exception, "(?i)mutation"):
+            self._scan_over_kv(body)(self.x, self.kv.clone())
+
+    def test_returning_an_input_is_rejected(self):
+        fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, k))
+        with self.assertRaisesRegex(Exception, "(?i)aliasing"):
+            fn(self.x, self.kv)
+
+    def test_carry_init_aliasing_an_input_is_rejected(self):
+        """Lowerings may update the carry in place, which would clobber the input."""
+        fn = self._scan_over_kv(
+            lambda c, x_t, k, v: (c + (x_t @ k.T).sum(), x_t @ v.T),
+            init=lambda k, v: v[0, 0],
+        )
+        with self.assertRaisesRegex(Exception, "carry initializer"):
+            fn(self.x, self.kv)
+
+
 if __name__ == "__main__":
     unittest.main()
