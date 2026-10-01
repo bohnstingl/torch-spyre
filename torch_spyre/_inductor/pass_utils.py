@@ -2136,16 +2136,22 @@ def finalize_work_division_for_scheduler(graph: GraphLowering) -> None:
         except Unsupported:
             continue
         collisions: list[str] = []
+        output_splits = {
+            sym: split
+            for sym, split in ownership.work_slices.items()
+            if write_index.coeff(sym) != 0
+        }
+        reduction_splits = {
+            sym: split
+            for sym, split in ownership.work_slices.items()
+            if write_index.coeff(sym) == 0
+        }
         for label, index, symbols in (
-            ("output", write_index, ownership.work_slices),
+            ("output", write_index, output_splits),
             (
                 "reduction",
                 read_index,
-                {
-                    sym: split
-                    for sym, split in ownership.work_slices.items()
-                    if write_index.coeff(sym) == 0
-                },
+                reduction_splits,
             ),
         ):
             seen: dict[sympy.Expr, tuple[sympy.Symbol, int, sympy.Expr]] = {}

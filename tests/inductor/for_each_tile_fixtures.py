@@ -961,6 +961,44 @@ def online_softmax_reference(
     return acc / denom
 
 
+# Batched-decode geometry: blocks per chunk, KV heads, queries per KV head, block.
+BROADCAST_MAX_SHAPE = (16, 2, 8, 128)
+
+
+def broadcast_running_max_fn(scores: torch.Tensor) -> torch.Tensor:
+    """Log-sum-exp whose body subtracts the updated running max across blocks.
+
+    ``m_new`` is the carry update, read with a broadcast over the block axis
+    the subtraction splits; the carry storage is partitioned over heads.
+    """
+    blocks, heads, queries, block = BROADCAST_MAX_SHAPE
+
+    def body(carry, tiles):
+        m, s = carry
+        (tile,) = tiles
+        tile = tile.reshape(blocks, 1, heads, queries, block)
+        chunk_max = tile.amax(dim=-1, keepdim=True).amax(dim=0, keepdim=True)
+        rescale = torch.exp(-torch.relu(chunk_max - m))
+        m_new = torch.maximum(m, chunk_max)
+        p = torch.exp(tile - m_new)
+        s_new = s * rescale + p.sum(dim=-1, keepdim=True).sum(dim=0, keepdim=True)
+        return (m_new, s_new), None
+
+    shape = (1, 1, heads, queries, 1)
+    m0 = torch.full(shape, float("-inf"), device=scores.device, dtype=scores.dtype)
+    s0 = torch.zeros(shape, device=scores.device, dtype=scores.dtype)
+    (m, s), _ = for_each_tile(
+        body, (scores,), dims=(0,), tile_size=blocks, init=(m0, s0)
+    )
+    return m + torch.log(s)
+
+
+def broadcast_running_max_reference(scores: torch.Tensor) -> torch.Tensor:
+    _, heads, queries, _ = BROADCAST_MAX_SHAPE
+    rows = scores.float().permute(1, 2, 0, 3).reshape(heads, queries, -1)
+    return torch.logsumexp(rows, dim=-1).reshape(1, 1, heads, queries, 1)
+
+
 ROWS, COLS = 8, 16
 STICK_ROWS, STICK_COLS = 256, 128
 

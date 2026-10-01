@@ -2914,6 +2914,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 continue
             if residency_by_buf.get(record.storage_name) is None:
                 carry_update_edges[record.update_name] = edge
+        carry_storage_by_update = {
+            update_name: edge.buf_name
+            for update_name, edge in carry_update_edges.items()
+        }
 
         input_clone_matches: dict[str, dict[str, list[tuple[int, int]]]] = {}
         # Consumer op name -> input clones for which it is the last reader, and so
@@ -3020,6 +3024,32 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 else:
                     parent_proj.append(storage_name)
                 cd_parent_matches[storage_name] = update_matches
+                cd_parent_relayouts.pop(storage_name, None)
+
+            # Reading an update reads the carry storage's own partition, so a
+            # resident carry must also match every reader of its updates. A
+            # relayout copy of the storage would not see the in-loop update.
+            alias_matches = (
+                {}
+                if op is None
+                else self._loop_carry_alias_matches(
+                    op,
+                    buf_divisions,
+                    carry_storage_by_update,
+                    divisions,
+                    op_by_name,
+                    prep_cache,
+                )
+            )
+            for storage_name, alias_pairs in alias_matches.items():
+                if storage_name in cd_parent_matches:
+                    allowed = set(alias_pairs)
+                    alias_pairs = [
+                        p for p in cd_parent_matches[storage_name] if p in allowed
+                    ]
+                elif storage_name not in parent_proj:
+                    parent_proj.append(storage_name)
+                cd_parent_matches[storage_name] = alias_pairs
                 cd_parent_relayouts.pop(storage_name, None)
 
             for input_name in parent_proj:
@@ -3136,6 +3166,49 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             read_dep=update_write.rename({record.update_name: record.storage_name}),
             prep_cache=prep_cache,
         )
+
+    @staticmethod
+    def _loop_carry_alias_matches(
+        consumer_op: Operation,
+        consumer_divs: list[CoreDivision],
+        storage_by_update: dict[str, str],
+        divisions: dict[str, list[CoreDivision]],
+        op_by_name: dict[str, Operation],
+        prep_cache: dict,
+    ) -> dict[str, list[tuple[int, int]]]:
+        """Storage match pairs for ``consumer_op``'s reads of carry updates.
+
+        ``propagate_mutation_layouts`` gives each update its storage's layout
+        after planning, so a read named after the update lands on the storage's
+        LX partition. Each such read is matched against the storage as a direct
+        read would be; one with no edge matches nothing.
+        """
+        matches: dict[str, list[tuple[int, int]]] = {}
+        for dep in op_read_writes(consumer_op).reads:
+            storage_name = storage_by_update.get(dep.name)
+            if storage_name is None or not isinstance(dep, MemoryDep):
+                continue
+            edge = build_residency_edge(
+                storage_name,
+                op_by_name[storage_name],
+                consumer_op,
+                [dep.rename({dep.name: storage_name})],
+                None,
+                prep_cache,
+            )
+            pairs = (
+                []
+                if edge is None
+                else edge.match_pairs(
+                    [cd.splits for cd in divisions[storage_name]],
+                    [cd.splits for cd in consumer_divs],
+                )
+            )
+            if storage_name in matches:
+                allowed = set(pairs)
+                pairs = [p for p in matches[storage_name] if p in allowed]
+            matches[storage_name] = pairs
+        return matches
 
     @staticmethod
     def _relayout_copy_buffers(

@@ -2311,6 +2311,31 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 [(0, 0), (1, 1)],
             )
 
+    def _alias_matches(self):
+        x = _isym("x")
+        self.rw[self.consumer_op] = MagicMock(
+            reads=[MemoryDep("update", x, (x,), (8,))],
+            writes=[MemoryDep("consumer", x, (x,), (8,))],
+        )
+        with self._patches():
+            return CoOptimizingAllocator._loop_carry_alias_matches(
+                self.consumer_op,
+                self.consumer_divs,
+                {"update": "plain"},
+                self.divisions,
+                self.op_by_name,
+                {},
+            )
+
+    def test_loop_carry_update_read_matches_like_a_storage_read(self):
+        # The update shares the storage's LX partition, so reading it is
+        # reading "plain": the same pairs as the direct read in the table.
+        self.assertEqual(self._alias_matches(), {"plain": [(0, 0), (1, 1)]})
+
+    def test_loop_carry_update_read_without_a_storage_write_matches_nothing(self):
+        self.rw[self.op_by_name["plain"]].writes = [StarDep("plain")]
+        self.assertEqual(self._alias_matches(), {"plain": []})
+
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):
         """Per-pair reimplementation of what ``match_pairs`` computes in

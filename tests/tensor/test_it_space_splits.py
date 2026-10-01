@@ -252,6 +252,37 @@ class TestItSpaceSplits(TestCase):
         self.assertEqual(op.op_it_space_splits, ({8: 4}, {}))
         self.assertFalse(hasattr(op, "iteration_space_ownership"))
 
+    def test_scheduler_transport_warns_only_if_axis_absent_from_both_indexes(self):
+        class Op:
+            def __init__(self):
+                write = MemoryDep("out", 8 * i1 + i2, (i0, i1, i2), (16, 8, 8))
+                read = MemoryDep("in", 8 * i1 + i2, (i0, i1, i2), (16, 8, 8))
+                self.read_writes = type(
+                    "ReadWrites", (), {"writes": [write], "reads": [read]}
+                )()
+                self.iteration_space_ownership = TensorWorkDivision(
+                    {i0: 8, i1: 1, i2: 1},
+                    {i0: sympy.Integer(0), i1: sympy.Integer(0), i2: sympy.Integer(0)},
+                )
+
+            def get_name(self):
+                return "absent"
+
+            def get_read_writes(self):
+                return self.read_writes
+
+        op = Op()
+        graph = type("Graph", (), {"operations": [op]})()
+        with self.assertLogs("spyre.inductor.pass_utils", "WARNING") as logs:
+            with patch(
+                "torch_spyre._inductor.pass_utils.iteration_space_from_op",
+                return_value={i0: 16, i1: 8, i2: 8},
+            ):
+                finalize_work_division_for_scheduler(graph)
+
+        self.assertIn("reduction:i0=absent", logs.output[0])
+        self.assertNotIn("output:i0=absent", logs.output[0])
+
 
 if __name__ == "__main__":
     run_tests()

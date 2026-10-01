@@ -58,6 +58,7 @@ import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
 from torch_spyre.constants import DEVICE_NAME
+from torch_spyre._inductor import scheduler as ts_scheduler
 from torch_spyre._inductor import passes as ts_passes
 from torch_spyre._inductor.passes import CustomPreSchedulingPasses
 from torch_spyre._inductor.scratchpad.coarse_tiling import (
@@ -87,7 +88,10 @@ from for_each_tile_fixtures import (
     abs_tiled_reference,
     add_tiled_fn,
     add_tiled_reference,
+    BROADCAST_MAX_SHAPE,
     batched_online_softmax_fn,
+    broadcast_running_max_fn,
+    broadcast_running_max_reference,
     nested_add_outer_row_inner_col_fn,
     nested_add_outer_row_inner_col_reference,
     nested_online_softmax_fn,
@@ -388,6 +392,32 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         )
         out = compiled(Q.to(DEVICE_NAME), K.to(DEVICE_NAME), V.to(DEVICE_NAME))
 
+        torch.testing.assert_close(
+            out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
+        )
+
+    def test_carry_update_broadcast_read_needs_no_lx_demotion(self):
+        """A broadcast read of a carry update is planned against its storage.
+
+        The update shares the carry storage's layout after planning. If LX
+        planning ignored its reader, the storage's head partition would fail
+        finalization under the block-split subtraction and only be demoted
+        during kernel preparation.
+        """
+        scores = cached_xavier(BROADCAST_MAX_SHAPE)
+        ref = broadcast_running_max_reference(dl16_round(scores.float()))
+
+        compiled = torch.compile(
+            broadcast_running_max_fn, backend="inductor", fullgraph=True
+        )
+        with patch.object(
+            ts_scheduler,
+            "demote_lx_relayout_group",
+            wraps=ts_scheduler.demote_lx_relayout_group,
+        ) as demote:
+            out = compiled(scores.to(DEVICE_NAME))
+
+        demote.assert_not_called()
         torch.testing.assert_close(
             out.cpu().float(), ref, atol=self.ATOL, rtol=self.RTOL
         )
