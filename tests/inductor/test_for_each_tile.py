@@ -98,6 +98,7 @@ Run:
 """
 
 import contextlib
+import itertools
 import os
 import unittest
 from typing import NamedTuple
@@ -106,6 +107,7 @@ import torch
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor.wsr import Gather, for_each_tile
+from torch_spyre._monkey_patch import _patch_scan_input_aliasing
 
 DUMP_DIR = os.environ.get("SPYRE_FOR_EACH_TILE_DUMP")
 
@@ -1067,6 +1069,9 @@ class TestForEachTileLowering(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(
+    _patch_scan_input_aliasing(), "torch_spyre's scan aliasing patch is inactive"
+)
 class TestScanInputAliasing(unittest.TestCase):
     """torch_spyre's scan patch (#4893): read-only loop inputs may share a storage."""
 
@@ -1091,16 +1096,26 @@ class TestScanInputAliasing(unittest.TestCase):
             return out
 
         k, v = self.kv.split(4, dim=-1)
-        traced = {
+        tracers = {
             "make_fx": lambda *a: make_fx(fn, tracing_mode="fake")(*a)(*a),
-            "torch.compile": torch.compile(fn, backend="inductor", fullgraph=True),
+            "torch.compile": lambda *a: torch.compile(
+                fn, backend="inductor", fullgraph=True
+            )(*a),
         }
-        for name, trace in traced.items():
-            with self.subTest(name):
+        modes = {
+            "grad": torch.enable_grad,
+            "no_grad": torch.no_grad,
+            "inference_mode": torch.inference_mode,
+        }
+        for (tracer, trace), (mode, ctx) in itertools.product(
+            tracers.items(), modes.items()
+        ):
+            with self.subTest(tracer=tracer, mode=mode), ctx():
                 torch._dynamo.reset()
                 torch.testing.assert_close(trace(self.x, self.kv), self.x @ k.T @ v)
 
-    def _scan_over_kv(self, body, init=None):
+    @staticmethod
+    def _scan_over_kv(body, init=None):
         from torch._higher_order_ops.scan import scan
 
         def fn(x, kv):
@@ -1110,12 +1125,25 @@ class TestScanInputAliasing(unittest.TestCase):
                 lambda c, x_t: body(c, x_t, k, v), carry, x.unflatten(0, (4, 2))
             )
 
+        return fn
+
+    def _compile(self, fn):
         return torch.compile(fn, backend="inductor", fullgraph=True)
+
+    def test_carry_init_sharing_an_input_storage(self):
+        """The loop never writes a carry in place, so its init may alias an input."""
+        fn = self._scan_over_kv(
+            lambda c, x_t, k, v: (c + (x_t @ k.T).sum(), x_t @ v.T),
+            init=lambda k, v: v[0, 0],
+        )
+        torch.testing.assert_close(
+            self._compile(fn)(self.x, self.kv), fn(self.x, self.kv)
+        )
 
     def test_aliased_inputs_requiring_grad_are_rejected(self):
         fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, x_t @ k.T @ v))
         with self.assertRaisesRegex(Exception, "Input-to-input aliasing"):
-            fn(self.x, self.kv.clone().requires_grad_())
+            self._compile(fn)(self.x, self.kv.clone().requires_grad_())
 
     def test_mutating_an_aliased_input_is_rejected(self):
         def body(c, x_t, k, v):
@@ -1123,21 +1151,38 @@ class TestScanInputAliasing(unittest.TestCase):
             return c + 1, x_t @ v.T
 
         with self.assertRaisesRegex(Exception, "(?i)mutation"):
-            self._scan_over_kv(body)(self.x, self.kv.clone())
+            self._compile(self._scan_over_kv(body))(self.x, self.kv.clone())
 
     def test_returning_an_input_is_rejected(self):
         fn = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, k))
         with self.assertRaisesRegex(Exception, "(?i)aliasing"):
-            fn(self.x, self.kv)
+            self._compile(fn)(self.x, self.kv)
 
-    def test_carry_init_aliasing_an_input_is_rejected(self):
-        """Lowerings may update the carry in place, which would clobber the input."""
-        fn = self._scan_over_kv(
-            lambda c, x_t, k, v: (c + (x_t @ k.T).sum(), x_t @ v.T),
-            init=lambda k, v: v[0, 0],
-        )
-        with self.assertRaisesRegex(Exception, "carry initializer"):
-            fn(self.x, self.kv)
+    def test_output_output_aliasing_is_rejected(self):
+        def body(c, x_t, k, v):
+            y = x_t @ k.T @ v
+            return c + 1, (y, y)
+
+        with self.assertRaisesRegex(Exception, "(?i)aliasing"):
+            self._compile(self._scan_over_kv(body))(self.x, self.kv)
+
+    def test_other_hops_stay_strict(self):
+        """Only scan is relaxed: cond rejects aliased closures, also inside a scan."""
+
+        def cond_on(x, k, v):
+            return torch.cond(x.sum() > 0, lambda: x @ k.T @ v, lambda: x @ v.T @ k, ())
+
+        def top_level(x, kv):
+            k, v = kv.split(4, dim=-1)
+            return cond_on(x, k, v)
+
+        nested = self._scan_over_kv(lambda c, x_t, k, v: (c + 1, cond_on(x_t, k, v)))
+        # 2.13's cond itself accepts aliasing once grad is disabled.
+        for name, fn in (("cond", top_level), ("cond inside scan", nested)):
+            with self.subTest(name), torch.enable_grad():
+                torch._dynamo.reset()
+                with self.assertRaisesRegex(Exception, "(?i)aliasing"):
+                    self._compile(fn)(self.x, self.kv)
 
 
 if __name__ == "__main__":

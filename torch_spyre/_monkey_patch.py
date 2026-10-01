@@ -558,25 +558,27 @@ def _patch_invoke_subgraph_decompositions():
     mod._extract_nested_region_config = _spyre_extract_nested_region_config
 
 
-def _patch_scan_input_aliasing():
+def _patch_scan_input_aliasing() -> bool:
     """Let ``scan`` read loop inputs that share a storage (torch-spyre#4893).
 
     The SDPA decomposition's outer ``for_each_tile`` levels (query, GQA group) capture
     K and V whole, and with a fused QKV projection those are two views of one
-    storage. ``scan`` rejects any two inputs on one storage, both in Dynamo's HOP
-    check and again in its functionalization, although read-only inputs cannot
-    observe each other.
+    storage. torch 2.13's ``scan`` rejects two inputs on one storage, in Dynamo's HOP
+    check and again in its functionalization, although it also rejects every input
+    mutation, so such inputs are read-only. Both checks now accept input-input
+    aliasing for ``scan``; Dynamo's still rejects it when an aliased input requires
+    grad, and input-output and output-output aliasing stay rejected.
 
-    Stopgap mirroring the PyTorch change proposed on that issue, until a torch
-    release carries it. Inputs may share a storage when no aliased input requires
-    grad and the body mutates none of its inputs. Carry initializers stay strict,
-    since lowerings may update the carry in place, and input-output and
-    output-output aliasing stay rejected.
+    Carries need no extra check: neither stock Inductor nor torch-spyre's loop
+    lowering (``_carry_real_input_is_private``) writes a carry's storage in place
+    while anything else can read it.
 
-    The mutation gate inspects the traced body rather than ``scan``'s
-    ``supports_input_mutation`` flag, which newer torch derives from grad mode.
-    Skipped when torch's internals differ from the 2.13 ones patched here.
+    Applied process-wide, so CPU and CUDA scans in the same process are relaxed
+    too. Only on torch 2.13 and 2.14, whose patched functions are identical; other
+    versions are skipped with a warning. Returns whether the patch is active.
     Idempotent.
+
+    TODO(#4893): remove with the first torch release that carries the upstream fix.
     """
     import contextvars
     import functools
@@ -585,59 +587,35 @@ def _patch_scan_input_aliasing():
     import torch
     from torch.utils import _pytree as pytree
 
-    try:
-        import torch._dynamo.output_graph as output_graph
-        import torch._dynamo.variables.higher_order_ops as hop_vars
-        import torch._higher_order_ops.scan  # noqa: F401
-        import torch._higher_order_ops.utils as hop_utils
-    except ImportError:
-        return
-    scan_module = sys.modules["torch._higher_order_ops.scan"]
+    release = tuple(int(p) for p in torch.__version__.split("+")[0].split(".")[:2])
+    if release not in ((2, 13), (2, 14)):
+        import warnings
+
+        warnings.warn(
+            f"scan input-aliasing patch not applied on torch {torch.__version__}; "
+            "fused-QKV attention may fail to compile (torch-spyre#4893)."
+        )
+        return False
+
+    import torch._dynamo.output_graph as output_graph
+    import torch._dynamo.variables.higher_order_ops as hop_vars
+    import torch._higher_order_ops.scan  # noqa: F401
+    import torch._higher_order_ops.utils as hop_utils
+
+    scan_op = sys.modules["torch._higher_order_ops.scan"].scan_op
     tracer_cls = output_graph.SubgraphTracer
-
     if getattr(tracer_cls.has_aliasing, "_spyre_scan_aliasing_patched", False):
-        return
-    functionalize_kernel = scan_module.scan_op.py_kernels.get(
-        torch._C.DispatchKey.Functionalize
-    )
-    closure = dict(
-        zip(
-            getattr(getattr(functionalize_kernel, "__code__", None), "co_freevars", ()),
-            getattr(functionalize_kernel, "__closure__", None) or (),
-        )
-    )
-    # py_functionalize_impl's three kernels share this one cell, so swapping its
-    # contents wraps scan's functionalization for every functionalization flavor.
-    functionalize_cell = closure.get("fn")
-    if (
-        functionalize_cell is None
-        or functionalize_cell.cell_contents is not scan_module.scan_functionalize
-        or not all(
-            hasattr(m, a)
-            for m, a in (
-                (hop_vars, "check_aliasing_and_input_mutation"),
-                (hop_vars, "get_tensor_storages"),
-                (hop_utils, "_check_alias_and_mutation"),
-                (hop_utils, "_collect_fake_inputs"),
-                (hop_utils, "_tensor_storage"),
-                (hop_utils, "potential_input_alias_or_mutation"),
-            )
-        )
-    ):
-        return
+        return True
 
-    # One flag per layer, each set only around the scan check it relaxes.
-    dynamo_relaxed = contextvars.ContextVar("spyre_scan_dynamo_relaxed", default=False)
-    functionalize_relaxed = contextvars.ContextVar(
-        "spyre_scan_functionalize_relaxed", default=False
-    )
+    relaxed = contextvars.ContextVar("spyre_scan_input_aliasing", default=False)
+    original_has_aliasing = tracer_cls.has_aliasing
     original_check = hop_vars.check_aliasing_and_input_mutation
     original_functionalize_check = hop_utils._check_alias_and_mutation
-    original_functionalize = scan_module.scan_functionalize
 
-    def has_aliasing(self, allow_input_input_aliasing=None):
-        if allow_input_input_aliasing is None:
-            allow_input_input_aliasing = dynamo_relaxed.get()
+    def has_aliasing(self):
+        """Torch's own check, or for scan a copy of it that skips input pairs."""
+        if not relaxed.get():
+            return original_has_aliasing(self)
         storages = hop_vars.get_tensor_storages
         example = hop_utils._collect_fake_inputs
 
@@ -651,11 +629,7 @@ def _patch_scan_input_aliasing():
             for storage in storages(value):
                 if storage in input_storages:
                     first = input_storages[storage]
-                    if (
-                        allow_input_input_aliasing
-                        and not value.requires_grad
-                        and not example([first])[0].requires_grad
-                    ):
+                    if not (value.requires_grad or example([first])[0].requires_grad):
                         continue
                     msg = (
                         f"Input-to-input aliasing detected at nodes {first} and {node}"
@@ -695,11 +669,7 @@ def _patch_scan_input_aliasing():
     def check_aliasing_and_input_mutation(
         subtracer, graph, supports_input_mutation, supports_aliasing, source_target
     ):
-        relax = (
-            source_target is scan_module.scan_op
-            and not subtracer.has_input_mutation().has_mutation
-        )
-        token = dynamo_relaxed.set(relax)
+        token = relaxed.set(source_target is scan_op)
         try:
             return original_check(
                 subtracer,
@@ -709,63 +679,32 @@ def _patch_scan_input_aliasing():
                 source_target,
             )
         finally:
-            dynamo_relaxed.reset(token)
+            relaxed.reset(token)
 
     @functools.wraps(original_functionalize_check)
     def _check_alias_and_mutation(graph_module, inputs_fake, name, pre_dispatch):
-        if name != "scan" or not functionalize_relaxed.get():
+        # scan_functionalize is the only caller passing "scan".
+        if name != "scan":
             return original_functionalize_check(
                 graph_module, inputs_fake, name, pre_dispatch
             )
-        # Only this scan's own check is relaxed, not any nested one it retraces.
-        token = functionalize_relaxed.set(False)
-        try:
-            result = hop_utils.potential_input_alias_or_mutation(
-                graph_module, inputs_fake, pre_dispatch
-            )
-        finally:
-            functionalize_relaxed.reset(token)
-        if result is True:  # the analysis could not run; keep the strict answer
-            return original_functionalize_check(
-                graph_module, inputs_fake, name, pre_dispatch
-            )
+        result = hop_utils.potential_input_alias_or_mutation(
+            graph_module, inputs_fake, pre_dispatch
+        )
+        # True: the analysis could not run (UnsupportedAliasMutationException).
+        if result is True:
+            raise RuntimeError(f"{name} might be aliasing the input or the output!")
         (_input_input, input_output, output_output), mutation = result
         if input_output or output_output:
             raise RuntimeError(f"{name} might be aliasing the input or the output!")
         if mutation:
             raise RuntimeError(f"{name} might be modifying the input!")
 
-    @functools.wraps(original_functionalize)
-    def scan_functionalize(ctx, combine_fn, init, xs, additional_inputs):
-        init_storages = [
-            hop_utils._tensor_storage(t)
-            for t in ctx.unwrap_tensors(init)
-            if isinstance(t, torch.Tensor)
-        ]
-        other_storages = {
-            hop_utils._tensor_storage(t)
-            for t in ctx.unwrap_tensors(additional_inputs)
-            if isinstance(t, torch.Tensor)
-        }
-        # xs need no check: the body only ever sees fresh copies of their slices.
-        if len(set(init_storages)) != len(init_storages) or other_storages.intersection(
-            init_storages
-        ):
-            raise RuntimeError(
-                "scan might be aliasing the input or the output! A carry initializer "
-                "shares storage with another input; clone it before calling scan."
-            )
-        token = functionalize_relaxed.set(True)
-        try:
-            return original_functionalize(ctx, combine_fn, init, xs, additional_inputs)
-        finally:
-            functionalize_relaxed.reset(token)
-
-    has_aliasing._spyre_scan_aliasing_patched = True
+    has_aliasing._spyre_scan_aliasing_patched = True  # type: ignore[attr-defined]
     tracer_cls.has_aliasing = has_aliasing
     hop_vars.check_aliasing_and_input_mutation = check_aliasing_and_input_mutation
     hop_utils._check_alias_and_mutation = _check_alias_and_mutation
-    functionalize_cell.cell_contents = scan_functionalize
+    return True
 
 
 # ── Safetensors hook + monkey-patch ──────────────────────────────────────────
