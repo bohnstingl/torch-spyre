@@ -44,6 +44,7 @@ from spyre_clickhouse_ingest import (
     insert_gha_artifact_result,
     insert_test_results,
     promote_xpass,
+    capability_declaration,
     cases_already_ingested,
     drop_older_case_attempts,
     benchmarks_already_ingested,
@@ -1185,22 +1186,21 @@ def copy_reused_cases(client, db: str, run_id: str, component: str, covered) -> 
             continue
         # Only the cases carrying this tier's tag: the covering run may have executed a
         # wider set, and importing all of it would credit this tier with foreign cases.
-        cases = schema_model.TEST_CASES.qualified(db)
         client.command(
             f"INSERT INTO {runs} "
-            "(run_id, test_case_id, component, status, duration_s, fail_message, props) "
+            "(run_id, test_case_id, component, status, duration_s, fail_message, props, tags, "
+            "measurements) "
             "SELECT {run_id:UUID}, cr.test_case_id, cr.component, cr.status, cr.duration_s, "
             # mapContains rather than a bare lookup: an older row predating ran_in has no
             # such key, and defaulting it to the SOURCE run keeps that row honest instead of
             # silently claiming this run executed it.
             "       cr.fail_message, "
             "       mapUpdate(cr.props, map('ran_in', "
-            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))) "
+            "           if(mapContains(cr.props,'ran_in'), cr.props['ran_in'], toString(cr.run_id)))), "
+            "       cr.tags, cr.measurements "
             f"FROM {runs} AS cr "
-            f"INNER JOIN {cases} AS c ON c.test_case_id = cr.test_case_id "
-            "     AND c.component = cr.component "
             "WHERE cr.run_id = {src:UUID} AND cr.component = {component:String} "
-            "  AND has(c.tags, concat('testtype__', {tier:String}))",
+            "  AND has(cr.tags, concat('testtype__', {tier:String}))",
             parameters={
                 "run_id": run_id,
                 "src": src_run,
@@ -1248,6 +1248,23 @@ def _perf_leg(legs: dict, args, run_id: str, measured: int) -> None:
             (run_id, "perf"), {"failed": 0, "total": 0, "duration_s": 0.0}
         )
         acc["total"] += measured
+
+
+def _capability_legs(legs: dict, run_id: str, cases: list) -> None:
+    """A leg per `capability.test_type` the cases declare, beside the run's functional one.
+
+    The verdicts themselves land in capability_runs; this is what ties them to the artifact.
+    """
+    for case in cases:
+        decl, _ = capability_declaration(case)
+        if not decl or case.get("status") == "skipped":
+            continue
+        acc = legs.setdefault(
+            (run_id, decl["test_type"]), {"failed": 0, "total": 0, "duration_s": 0.0}
+        )
+        acc["total"] += 1
+        acc["failed"] += case.get("status") in ("failed", "error")
+        acc["duration_s"] += float(case.get("duration_s", 0) or 0)
 
 
 def _write_artifact_verdicts(client, v2db: str, args, legs: dict) -> None:
@@ -1835,6 +1852,7 @@ def main():
                         _acc["failed"] += int(run.get("failed", 0) or 0)
                         _acc["total"] += int(run.get("total_tests", 0) or 0)
                         _acc["duration_s"] += float(run.get("duration_s", 0) or 0)
+                        _capability_legs(artifact_legs, _v2_run_id, cases)
             except Exception as _v2_err:
                 v2_failed_files.append(xml_path.name)
                 print(
