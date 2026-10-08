@@ -31,6 +31,7 @@ from torch_spyre._inductor.pass_utils import (
 from torch._inductor.virtualized import V
 from torch._inductor.ir import (
     ComputedBuffer,
+    IRNode,
     TensorBox,
     StorageBox,
     ReinterpretView,
@@ -41,8 +42,30 @@ from torch._inductor.ir import (
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
-from torch_spyre._inductor.ir import FixedTiledLayout
+from torch_spyre._inductor.ir import (
+    AllGatherAsyncFallback,
+    AllReduceAsyncFallback,
+    BroadcastAsyncFallback,
+    FixedTiledLayout,
+)
 from torch_spyre._inductor.pass_utils import origin_in_graph
+
+# Collectives whose codegen reads exactly one tensor operand, ``inputs[0]``, and
+# only through ``codegen_reference``/``get_layout``: repointing that operand at
+# an addressing-equivalent copy is the complete rewrite.
+_REWRITABLE_COLLECTIVES = (
+    AllReduceAsyncFallback,
+    AllGatherAsyncFallback,
+    BroadcastAsyncFallback,
+)
+
+
+def _unwrapped_buffer_name(node) -> str | None:
+    while not isinstance(node, Buffer):
+        node = getattr(node, "data", None)
+        if node is None:
+            return None
+    return node.get_name()
 
 
 class GraphEditor:
@@ -359,6 +382,59 @@ class GraphEditor:
         So instead we just allow ops that wrap a Pointwise or Reduction.
         """
         return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
+
+    @staticmethod
+    def collective_operand_name(op: Operation) -> str | None:
+        """The buffer a rewritable collective's operand names, or ``None``.
+
+        ``None`` when ``op`` is not one of ``_REWRITABLE_COLLECTIVES`` or a
+        ``ReinterpretView`` sits on its operand chain: the view would have to be
+        rebuilt around the new storage, and the view object may be shared with
+        another op, so such a consumer is not rewritten.
+        """
+        if not isinstance(op, _REWRITABLE_COLLECTIVES) or len(op.inputs) != 1:
+            return None
+        node = op.inputs[0]
+        while not isinstance(node, Buffer):
+            if not isinstance(node, TensorBox | StorageBox):
+                return None
+            node = node.data
+        return node.get_name()
+
+    def replace_collective_operand(
+        self, op: Operation, old_name: str, new: ComputedBuffer
+    ) -> None:
+        """Make a rewritable collective read (and, for all_reduce, mutate) ``new``.
+
+        The operand's ``TensorBox``/``StorageBox`` wrappers are rebuilt around
+        ``new`` rather than edited, so no IR object shared with another op
+        changes. ``new`` must be addressing-equivalent to ``old_name`` (same
+        layout): the collective's plan is sized from the operand's layout.
+        """
+        if self.collective_operand_name(op) != old_name:
+            raise ValueError(
+                f"{op.get_name()} is not a rewritable collective reading {old_name}"
+            )
+        wrappers = []
+        node = op.inputs[0]
+        while not isinstance(node, Buffer):
+            wrappers.append(type(node))
+            node = node.data
+        replacement: IRNode = new
+        for wrapper in reversed(wrappers):
+            replacement = wrapper(replacement)
+        op.inputs = [replacement]
+        invalidate_op_read_writes(op)
+
+        new_name = new.get_name()
+        op_name = op.get_name()
+        kept: list[IRNode] = []
+        moved: list[IRNode] = []
+        for user in self.lowering.name_to_users.get(old_name, []):
+            is_op = _unwrapped_buffer_name(user) == op_name
+            (moved if is_op else kept).append(user)
+        self.lowering.name_to_users[old_name] = kept
+        self.lowering.name_to_users[new_name].extend(moved)
 
     def _replace_loop_input(
         self, old_loop: Operation, old_name: str, new_name: str
