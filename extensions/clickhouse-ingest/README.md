@@ -60,6 +60,7 @@ to change an id; if it ever does, those tests are the thing that must stop it.
 | `tag_families.yaml` | the tag families (`SPYRE_TAG_FAMILIES` overrides it) |
 | `results.py` | the JUnit/benchmark XML ingest (`python -m spyre_clickhouse_ingest results`) |
 | `gha_runs.py` | polls GitHub Actions runs and jobs into `pipeline_runs` (`source='gha'`); the Jenkins rows come from spyre-frameworks |
+| `ci_run_timings.py` | one orchestrator run's timeline into `ci_run_timings`, a row per build and test leg (`python -m spyre_clickhouse_ingest ci-run-timings write`); the batch comes from spyre-frameworks |
 
 ## Naming an artifact (simple -> advanced)
 
@@ -104,6 +105,12 @@ writes nothing; with `--lookup off` it needs no database.
 a run tested; `--platform` is a deprecated alias of `--arch`, and `--tag-date` defaults to the
 run's start day. `--artifact-id <id>|<base>|<installed>` is derive-gha-artifact-id's record
 (= `--artifact gha:<record>`); a bare `--artifact-id` that is not recorded writes no verdict.
+`--ci-event push|pull_request|schedule` also tags that artifact as Jenkins tags its builds:
+`<repo>@<sha12>` (`main`) for a push to main, that plus `nightly-<run day>` (`nightly`) for a
+scheduled run of main, `<repo>#<pr>` and `<repo>#<pr>@<sha12>` (`pr`) for a pull request.
+`ci_tags()` is the same rule for a writer that calls `ensure` itself.
+`--capability-legs-only` writes just the capability legs (other than `--trigger-type`'s), for a
+Jenkins leg whose own verdict the orchestrator records under the same run_id.
 
 **SDK**:
 
@@ -149,7 +156,8 @@ grep -rn 'scripts/ingest_xml\.py' --include='*.y*ml' --include='Jenkinsfile*' --
 
 `test_cases`, `test_case_runs`, `benchmarks`, `benchmark_runs` (DDL: `functional_tests_v2.sql`)
 and `artifacts`, `artifact_refs`, `artifact_tags`, `artifact_results` (DDL: `artifacts_v2.sql`),
-and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`).
+and `pipeline_runs` (DDL: `schema/47-pipeline-runs.sql`), and `ci_run_timings`
+(DDL: `schema/48-ci-run-timings.sql`).
 The DDL itself is applied by the CI pipeline that owns the warehouse, not from this repo.
 
 The model holds columns, order and the DDL's CHECK sets — not the DDL itself. `TABLES` is pinned
