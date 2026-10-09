@@ -112,7 +112,10 @@ from torch_spyre._inductor.scratchpad.utils import (
     counted_loop_group_path,
     counted_loop_lifetime_overrides,
 )
-from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
+from torch_spyre._inductor.scratchpad.graph_editor import (
+    GraphEditor,
+    unwrapped_buffer_name,
+)
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreEmptyFallback
 from torch_spyre._inductor.constants import (
     BATCH_MATMUL_FP8_OP,
@@ -293,13 +296,14 @@ class DrainPlan:
     The same drain serves a carry whose only post-loop access is a collective
     (e.g. the TP all_reduce of a traced MoE's expert sum).  A collective needs a
     materialized HBM operand, so without the drain the carry -- and with it
-    every in-loop update -- stays in HBM.  With ``extern_consumer`` set, the
+    every in-loop update -- stays in HBM.  With ``collective`` set, the
     drain is an ordinary HBM buffer and the collective is rewired to it.
 
     Attributes
     ----------
     storage_name:
-        The carry's initial storage (also the single graph-output entry).
+        The carry's initial storage; for a graph-output carry also its single
+        graph-output entry.
     update_name:
         Its one tagged in-loop mutator (``_loop_carry_record.update_name``).
     loop_group:
@@ -311,7 +315,7 @@ class DrainPlan:
     loop_origin:
         The exact FX ``while_loop`` HOP node retained by the splice; the drain
         clone's FX node is inserted after it.
-    extern_consumer:
+    collective:
         ``None`` for a graph-output carry.  Otherwise the single post-loop
         collective reading the storage, which the push repoints at the drain.
     """
@@ -321,7 +325,7 @@ class DrainPlan:
     loop_group: tuple[int, ...]
     anchor_op: Operation
     loop_origin: Any
-    extern_consumer: Optional[Operation] = None
+    collective: Optional[Operation] = None
 
 
 def _access_group_path(op: Operation) -> tuple[int, ...]:
@@ -330,17 +334,6 @@ def _access_group_path(op: Operation) -> tuple[int, ...]:
     if isinstance(op, ExternKernel):
         return ()
     return tuple(getattr(getattr(op, "loop_info", None), "loop_group_id", ()) or ())
-
-
-def _graph_output_buffer_name(entry: Any) -> Optional[str]:
-    """The buffer name a ``graph_outputs`` entry names, or None if unwrappable."""
-
-    node = entry
-    while not isinstance(node, Buffer):
-        node = getattr(node, "data", None)
-        if node is None:
-            return None
-    return node.get_name()
 
 
 def _is_reinterpret_output_entry(entry: Any) -> bool:
@@ -377,12 +370,13 @@ def validated_drain_plans(
     created):
 
     P1  boundary cloning is enabled;
-    P2  exactly one ``graph.graph_outputs`` entry names the storage, and no
-        ReinterpretView sits anywhere on its wrapper chain
+    P2a (graph output) exactly one ``graph.graph_outputs`` entry names the
+        storage, and no ReinterpretView sits anywhere on its wrapper chain
         (``change_graph_output`` replaces the first match, so an aliased entry
-        declines, and it repoints a view in place); or no entry names it and
-        its only access outside the loop is one post-loop collective whose
-        operand :meth:`GraphEditor.collective_operand_name` resolves to it
+        declines, and it repoints a view in place); or
+    P2b (collective) no entry names the storage, and its only access outside
+        the loop is one post-loop collective whose operand
+        :meth:`GraphEditor.collective_operand_name` resolves to it
         (:func:`_sole_post_loop_collective`);
     P3  the storage op carries a ``LoopCarryRecord`` whose ``storage_name`` is
         its own name and whose ``update_name`` resolves to exactly one op;
@@ -442,16 +436,18 @@ def validated_drain_plans(
         storage_mutators = mutators.get(name, [])
         if len(storage_mutators) != 1 or storage_mutators[0] is not update_op:
             continue
-        in_loop_access_elsewhere = any(
-            op is not update_op
-            and _access_group_path(op)
+        # Every access but the initializer's and the update's.
+        accessors = [
+            op
+            for op in graph.operations
+            if op is not storage_op
+            and op is not update_op
             and any(
                 dep.name == name
                 for dep in op_read_writes(op).reads | op_read_writes(op).writes
             )
-            for op in graph.operations
-        )
-        if in_loop_access_elsewhere:
+        ]
+        if any(_access_group_path(op) for op in accessors):
             continue
         anchor_op = None
         for op in graph.operations:
@@ -463,19 +459,17 @@ def validated_drain_plans(
         output_entries = [
             index
             for index, entry in enumerate(graph.graph_outputs)
-            if _graph_output_buffer_name(entry) == name
+            if unwrapped_buffer_name(entry) == name
         ]
-        extern_consumer = None
+        collective = None
         if len(output_entries) == 1:
             if _is_reinterpret_output_entry(graph.graph_outputs[output_entries[0]]):
                 continue
         elif output_entries:
             continue
         else:
-            extern_consumer = _sole_post_loop_collective(
-                graph, name, storage_op, update_op, anchor_op
-            )
-            if extern_consumer is None:
+            collective = _sole_post_loop_collective(graph, name, accessors, anchor_op)
+            if collective is None:
                 continue
         plans[name] = DrainPlan(
             storage_name=name,
@@ -483,7 +477,7 @@ def validated_drain_plans(
             loop_group=update_group,
             anchor_op=anchor_op,
             loop_origin=loop_origin,
-            extern_consumer=extern_consumer,
+            collective=collective,
         )
     return plans
 
@@ -491,30 +485,20 @@ def validated_drain_plans(
 def _sole_post_loop_collective(
     graph: GraphLowering,
     name: str,
-    storage_op: Operation,
-    update_op: Operation,
+    accessors: Sequence[Operation],
     anchor_op: Operation,
 ) -> Optional[Operation]:
     """The collective that is ``name``'s only access outside its loop, or None.
 
-    Every op but the storage's initializer and its tagged update that reads or
-    writes the storage is collected.  The plan applies only when that is a
-    single op running after the whole loop, and it is a collective whose
-    operand :class:`GraphEditor` can repoint at the drain.  Any other post-loop
-    access would still name the storage once the collective reads the drain --
-    and an in-place all_reduce's result lives in its operand -- so it declines.
+    ``accessors`` are the ops, other than the storage's initializer and its
+    tagged update, that read or write the storage.  The plan applies only when
+    that is a single op running after the whole loop, and it is a collective
+    whose operand :class:`GraphEditor` can repoint at the drain.  Any other
+    post-loop access would still name the storage once the collective reads the
+    drain -- and an in-place all_reduce's result lives in its operand -- so it
+    declines.
     """
 
-    accessors = [
-        op
-        for op in graph.operations
-        if op is not storage_op
-        and op is not update_op
-        and any(
-            dep.name == name
-            for dep in op_read_writes(op).reads | op_read_writes(op).writes
-        )
-    ]
     if len(accessors) != 1:
         return None
     consumer = accessors[0]
@@ -530,7 +514,7 @@ def _drain_lifetime_end_overrides(
     drain_plans: Mapping[str, DrainPlan],
     graph_end: int,
 ) -> None:
-    """Extend every planned drain storage's lifetime to the graph exit, in place.
+    """Extend each graph-output drain storage's lifetime to the graph exit, in place.
 
     All solver intervals are pre-insertion indices and ``graph_end =
     len(graph.operations)`` is the exclusive end every pre-insertion op lies
@@ -539,12 +523,29 @@ def _drain_lifetime_end_overrides(
     strictly before the fill), which is what makes the post-solve drain read
     safe regardless of where the scheduler eventually places it.  This only
     removes reuse; it adds no unpriced occupancy and no cost term.
+
+    A collective drain is not extended: the collective reads the storage, so
+    the storage already lives until the collective, which must run after the
+    drain it reads.  Extending it would hold every layer's carry in LX to the
+    graph exit.
     """
 
-    for planned_name in drain_plans:
+    for planned_name, plan in drain_plans.items():
+        if plan.collective is not None:
+            continue
         lifetime_end_overrides[planned_name] = max(
             lifetime_end_overrides.get(planned_name, 0), graph_end
         )
+
+
+def _drained_collectives(drain_plans: Mapping[str, DrainPlan]) -> dict[str, str]:
+    """Storage name -> the collective its drain plan repoints at the drain."""
+
+    return {
+        name: plan.collective.get_name()
+        for name, plan in drain_plans.items()
+        if plan.collective is not None
+    }
 
 
 def _clear_loop_membership_metadata(op: Operation) -> None:
@@ -1929,7 +1930,8 @@ class ScratchpadAllocator:
         to B itself. The graph is made to have C as its output.
 
         - A buffer that is neither a graph input nor a graph output gets the LX allocation assigned
-        to itself."""
+        to itself.  If it is a loop carry whose drain plan names a collective, a post-loop clone C
+        is also inserted and the collective is made to read C."""
         outputs = set(graph.get_output_names())
         inputs = set(graph.graph_input_names)
 
@@ -1996,7 +1998,7 @@ class ScratchpadAllocator:
 
             else:
                 drain_plan = drain_plans.get(b.name)
-                if drain_plan is not None and drain_plan.extern_consumer is not None:
+                if drain_plan is not None and drain_plan.collective is not None:
                     # The collective needs an HBM operand: give it a post-loop
                     # copy of the resident carry, exactly like the graph-output
                     # drain above, and leave the carry itself in LX.
@@ -2013,7 +2015,7 @@ class ScratchpadAllocator:
                     )
                     _clear_loop_membership_metadata(drained)
                     graph_editor.replace_collective_operand(
-                        drain_plan.extern_consumer, b.name, drained
+                        drain_plan.collective, b.name, drained
                     )
                 self._set_one_allocation(buf, b.address, b.lx_view)
 
@@ -3119,13 +3121,8 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         }
         # Likewise a drained carry's collective still reads the carry here; the
         # push repoints it at the drain, so it does not constrain the carry.
-        drained_readers = {
-            name: plan.extern_consumer.get_name()
-            for name, plan in self._validated_drain_plans.items()
-            if plan.extern_consumer is not None
-        }
         _, reasons, views = get_ncores_for_buffers(
-            graph, drained_readers=drained_readers
+            graph, drained_readers=_drained_collectives(self._validated_drain_plans)
         )
         for buffer in allocation:
             # A relayout copy is not a graph buffer: materialize_lx_relayouts
@@ -3727,9 +3724,9 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             counted_loop_lifetime_overrides(graph)
         )
         # A planned drain is a new post-solve op that reads the carry storage
-        # after the loop, so the storage must stay live to the graph exit.  This
-        # is inside the solve, so the extension only removes reuse and stays
-        # priced -- it adds no cost term and no capacity.
+        # after the loop, so a graph-output storage must stay live to the graph
+        # exit.  This is inside the solve, so the extension only removes reuse
+        # and stays priced -- it adds no cost term and no capacity.
         drain_plans = self._validated_drain_plans
         if drain_plans:
             _drain_lifetime_end_overrides(
@@ -3738,11 +3735,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
         # A collective has no division pair with any resident buffer, so its
         # edge to a carry would force the carry into HBM.  A planned drain is
         # what that collective reads instead, so the edge does not exist.
-        drained_collective_operands = {
-            plan.extern_consumer.get_name(): storage_name
-            for storage_name, plan in (drain_plans or {}).items()
-            if plan.extern_consumer is not None
-        }
+        drained_collectives = _drained_collectives(drain_plans)
         mem_usage = mem_usage_by_buf(graph)
         in_place = {} if in_place is None else in_place
         op_by_name = {op.name: op for op in graph.operations}
@@ -3844,10 +3837,11 @@ class CoOptimizingAllocator(ScratchpadAllocator):
                 )
             ]
             size = info["size"]  # total footprint; solver divides per chosen cd
-            parent_proj = info["op_inputs"].copy()
-            drained = drained_collective_operands.get(output_name)
-            if drained is not None and drained in parent_proj:
-                parent_proj.remove(drained)
+            parent_proj = [
+                parent
+                for parent in info["op_inputs"]
+                if drained_collectives.get(parent) != output_name
+            ]
             residency_edges = self._parent_residency_edges(
                 op, parent_proj, op_by_name, prep_cache, residency_by_buf
             )

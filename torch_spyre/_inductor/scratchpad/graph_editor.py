@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 from torch.fx import Node
 from torch.fx.graph import Graph
 from torch._inductor.dependencies import MemoryDep
@@ -42,25 +44,18 @@ from torch._inductor.ir import (
 )
 from torch._inductor.lowering import clone as clone_lowering, lowerings
 
-from torch_spyre._inductor.ir import (
-    AllGatherAsyncFallback,
-    AllReduceAsyncFallback,
-    BroadcastAsyncFallback,
-    FixedTiledLayout,
-)
+from torch_spyre._inductor.ir import AllReduceAsyncFallback, FixedTiledLayout
 from torch_spyre._inductor.pass_utils import origin_in_graph
 
 # Collectives whose codegen reads exactly one tensor operand, ``inputs[0]``, and
 # only through ``codegen_reference``/``get_layout``: repointing that operand at
-# an addressing-equivalent copy is the complete rewrite.
-_REWRITABLE_COLLECTIVES = (
-    AllReduceAsyncFallback,
-    AllGatherAsyncFallback,
-    BroadcastAsyncFallback,
-)
+# an addressing-equivalent copy is the complete rewrite.  all_gather and
+# broadcast share that shape but have no test reading a loop carry yet.
+_REWRITABLE_COLLECTIVES = (AllReduceAsyncFallback,)
 
 
-def _unwrapped_buffer_name(node) -> str | None:
+def unwrapped_buffer_name(node: Any) -> str | None:
+    """The name of the buffer under ``node``'s wrappers, or None if unwrappable."""
     while not isinstance(node, Buffer):
         node = getattr(node, "data", None)
         if node is None:
@@ -379,7 +374,10 @@ class GraphEditor:
 
             inputs_kernel.get_free_symbol_uses.clear_cache(inputs_kernel)
 
-        So instead we just allow ops that wrap a Pointwise or Reduction.
+        So instead we just allow ops that wrap a Pointwise or Reduction.  The
+        one exception is :meth:`replace_collective_operand`, where that swap is
+        the complete rewrite because the collective's codegen reads only
+        ``inputs[0]``.
         """
         return hasattr(op, "data") and isinstance(op.data, Pointwise | Reduction)
 
@@ -420,18 +418,31 @@ class GraphEditor:
         while not isinstance(node, Buffer):
             wrappers.append(type(node))
             node = node.data
+        old_layout, new_layout = node.get_layout(), new.get_layout()
+        if (
+            old_layout.dtype != new_layout.dtype
+            or list(old_layout.size) != list(new_layout.size)
+            or list(old_layout.stride) != list(new_layout.stride)
+            or old_layout.offset != new_layout.offset
+            or getattr(old_layout, "device_layout", None)
+            != getattr(new_layout, "device_layout", None)
+        ):
+            raise ValueError(
+                f"{new.get_name()} is not addressing-equivalent to {old_name}"
+            )
         replacement: IRNode = new
         for wrapper in reversed(wrappers):
             replacement = wrapper(replacement)
         op.inputs = [replacement]
         invalidate_op_read_writes(op)
+        op.get_free_symbol_uses.clear_cache(op)
 
         new_name = new.get_name()
         op_name = op.get_name()
         kept: list[IRNode] = []
         moved: list[IRNode] = []
         for user in self.lowering.name_to_users.get(old_name, []):
-            is_op = _unwrapped_buffer_name(user) == op_name
+            is_op = unwrapped_buffer_name(user) == op_name
             (moved if is_op else kept).append(user)
         self.lowering.name_to_users[old_name] = kept
         self.lowering.name_to_users[new_name].extend(moved)

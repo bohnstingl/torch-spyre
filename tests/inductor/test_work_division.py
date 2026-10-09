@@ -34,6 +34,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.utils import fresh_cache
 from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._ordered_set import OrderedSet
 
 from torch_spyre._C import (
     DataFormats,
@@ -61,6 +62,7 @@ from torch_spyre._inductor.scratchpad.allocator import (
     CoreDivision,
     ScratchpadAllocator,
 )
+from torch_spyre._inductor.scratchpad.graph_editor import GraphEditor
 from torch_spyre._inductor.scratchpad.greedy_solver import GreedyLayoutSolver
 from torch_spyre._inductor.scratchpad.plan_solver import (
     CoreDivisionBuffer,
@@ -2450,47 +2452,28 @@ class TestResidencyEdgeMatching(unittest.TestCase):
                 allocator._loop_carry_read_edges(update_op, carry_edges, {}), {}
             )
 
-    def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
-        """A drained carry under the carry-read gate: resident only if readers agree.
-
-        ``plain`` is a ``for_each_tile`` carry: filled before the loop, updated
-        in place by ``update`` and returned from the graph. Inside the loop,
-        ``consumer`` reads the update's name, so it reads the storage's bytes.
-        The post-loop drain plan makes this mutated graph output eligible for
-        LX, which is exactly when the read edge above starts to matter. The
-        real drain validator, buffer build, CP-SAT solve and push run on one
-        small graph (fill, update, reader, then an op after the loop):
-
-        * the reader can slice the storage the way the storage is owned: the
-          storage is resident, stays live to the graph exit, and the push emits
-          one drain clone after the loop's last member;
-        * every reader division slices it another way (same core count, other
-          axes, as in #4990): the edge admits no pair, the solver keeps the
-          storage in HBM, and the push emits nothing.
-        """
-        try:
-            from ortools.sat.python import cp_model  # noqa: F401
-        except ImportError:
-            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
-        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
-        from torch.utils._ordered_set import OrderedSet
-
+    @staticmethod
+    def _rw(reads, writes):
         x = _isym("x")
+        return SimpleNamespace(
+            reads=OrderedSet(MemoryDep(n, x, (x,), (8,)) for n in reads),
+            writes=OrderedSet(MemoryDep(n, x, (x,), (8,)) for n in writes),
+        )
 
-        def dep(name):
-            return MemoryDep(name, x, (x,), (8,))
+    def _drained_carry_graph(self, after_loop, outputs):
+        """A small graph around one drained ``for_each_tile`` carry.
 
-        def rw(reads, writes):
-            return SimpleNamespace(
-                reads=OrderedSet(dep(n) for n in reads),
-                writes=OrderedSet(dep(n) for n in writes),
-            )
+        ``plain`` is filled before the loop and updated in place by
+        ``update``.  Inside the loop, ``consumer`` reads the update's name, so
+        it reads the storage's bytes.  ``after_loop`` runs after the loop and
+        ``outputs`` are the graph outputs.
+        """
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 
         storage_op = self.op_by_name["plain"]
         update_op = self._carry_update()
         reader_op = self.consumer_op
-        tail_op = self._op("tail")
-        ops = [storage_op, update_op, reader_op, tail_op]
+        ops = [storage_op, update_op, reader_op, *after_loop]
         for op in ops:
             op.name = op.get_name()
             op.layout = _fixed_tiled_layout((8, 64))
@@ -2498,15 +2481,15 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         graph = MagicMock()
         graph.operations = ops
         graph.graph_input_names = []
-        graph.graph_outputs = [storage_op]
-        graph.get_output_names.return_value = ["plain"]
+        graph.graph_outputs = list(outputs)
+        graph.get_output_names.return_value = [op.get_name() for op in outputs]
         graph.get_buffer.side_effect = op_by_name.get
         # The drain's FX clone reads the storage's own FX node.
         graph.graph = torch.fx.Graph()
         storage_op.origins = OrderedSet([graph.graph.placeholder("plain")])
 
-        # One counted loop holds the update and the reader; the fill and the
-        # tail run outside it. The update writes through the storage.
+        # One counted loop holds the update and the reader. The update writes
+        # through the storage.
         loop = CoarseTileInfo(
             loop_group_id=(0,), loop_count=[sympy.Integer(4)], loop_tiled_dims=[[]]
         )
@@ -2523,12 +2506,93 @@ class TestResidencyEdgeMatching(unittest.TestCase):
         update_op.layout.target = storage_op
         self.rw.update(
             {
-                storage_op: rw([], ["plain"]),
-                update_op: rw(["plain"], ["update"]),
-                reader_op: rw(["update"], ["consumer"]),
-                tail_op: rw([], ["tail"]),
+                storage_op: self._rw([], ["plain"]),
+                update_op: self._rw(["plain"], ["update"]),
+                reader_op: self._rw(["update"], ["consumer"]),
             }
         )
+        return graph, ops
+
+    def _plan_solve_push(self, graph, divisions, mem_usage, residency):
+        """Run the real drain validator, buffer build, CP-SAT solve and push.
+
+        Returns ``(plans, built, solved, editor_cls)``, with buffers by name.
+        """
+        allocator = CoOptimizingAllocator(
+            allocator_module._make_cpsat_solver, size=4096
+        )
+        with ExitStack() as stack:
+            stack.enter_context(self._patches())
+            for target, kwargs in (
+                ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
+                ("allocator.clone_at_graph_boundaries", {"return_value": True}),
+                ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
+                ("allocator.materialize_lx_relayouts", {}),
+            ):
+                stack.enter_context(
+                    patch(f"torch_spyre._inductor.scratchpad.{target}", **kwargs)
+                )
+            stack.enter_context(
+                patch.object(
+                    allocator,
+                    "_residency_by_buf",
+                    side_effect=lambda *a, **k: residency,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
+                )
+            )
+            stack.enter_context(patch.object(allocator, "_set_one_allocation"))
+            editor_cls = stack.enter_context(
+                patch.object(allocator_module, "GraphEditor")
+            )
+            # The validator asks the real editor which collectives it rewrites.
+            editor_cls.collective_operand_name.side_effect = (
+                GraphEditor.collective_operand_name
+            )
+
+            plans = allocator_module.validated_drain_plans(
+                graph, division_is_fixed=False
+            )
+            allocator._validated_drain_plans = plans
+            built = allocator._build_cd_bound_buffers(
+                graph, {}, allocator_module._DivisionMap(divisions, set())
+            )
+            solver = allocator.layout_planning(built, allocator.size)
+            solved = {b.name: b for b in solver.plan_layout()}
+            # _commit_divisions would record the committed ownership here.
+            for op in graph.operations:
+                op.iteration_space_ownership = object()
+            allocator._push_allocation(graph, list(solved.values()), [])
+        return plans, {b.name: b for b in built}, solved, editor_cls
+
+    def test_carry_read_gate_decides_whether_the_post_loop_drain_is_emitted(self):
+        """A drained carry under the carry-read gate: resident only if readers agree.
+
+        The carry of :meth:`_drained_carry_graph` is returned from the graph,
+        and ``tail`` runs after the loop. The post-loop drain plan makes this
+        mutated graph output eligible for LX, which is exactly when the read
+        edge of ``consumer`` starts to matter. The real drain validator, buffer
+        build, CP-SAT solve and push run on it:
+
+        * the reader can slice the storage the way the storage is owned: the
+          storage is resident, stays live to the graph exit, and the push emits
+          one drain clone after the loop's last member;
+        * every reader division slices it another way (same core count, other
+          axes, as in #4990): the edge admits no pair, the solver keeps the
+          storage in HBM, and the push emits nothing.
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
+
+        tail_op = self._op("tail")
+        storage_op = self.op_by_name["plain"]
+        graph, ops = self._drained_carry_graph([tail_op], [storage_op])
+        self.rw[tail_op] = self._rw([], ["tail"])
         mem_usage = {
             "plain": {"size": 256, "op_inputs": []},
             # A mutation alias is unsized, as mem_usage_by_buf reports it.
@@ -2536,69 +2600,31 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             "consumer": {"size": 256, "op_inputs": ["update"]},
             "tail": {"size": 256, "op_inputs": []},
         }
-
-        def residency(*_args, **_kwargs):
-            # The verdicts _residency_by_buf gives these ops: the plan clears
-            # the storage's "graph output mutated after production" refusal
-            # (TestLoopCarryLxEligibility covers that branch); the update is a
-            # mutation alias, never an LX buffer itself.
-            return {
-                "plain": None,
-                "update": "op not allowed",
-                "consumer": None,
-                "tail": None,
-            }
+        # The verdicts _residency_by_buf gives these ops: the plan clears the
+        # storage's "graph output mutated after production" refusal
+        # (TestLoopCarryLxEligibility covers that branch); the update is a
+        # mutation alias, never an LX buffer itself.
+        residency = {
+            "plain": None,
+            "update": "op not allowed",
+            "consumer": None,
+            "tail": None,
+        }
 
         def run(reader_divs):
-            allocator = CoOptimizingAllocator(
-                allocator_module._make_cpsat_solver, size=4096
-            )
             divisions = {
                 "plain": self.parent_divs,
                 "update": self.parent_divs,
                 "consumer": reader_divs,
                 "tail": self.parent_divs[:1],
             }
-            with ExitStack() as stack:
-                stack.enter_context(self._patches())
-                for target, kwargs in (
-                    ("utils.op_read_writes", {"side_effect": lambda op: self.rw[op]}),
-                    ("allocator.clone_at_graph_boundaries", {"return_value": True}),
-                    ("allocator.mem_usage_by_buf", {"return_value": mem_usage}),
-                    ("allocator.materialize_lx_relayouts", {}),
-                ):
-                    stack.enter_context(
-                        patch(f"torch_spyre._inductor.scratchpad.{target}", **kwargs)
-                    )
-                stack.enter_context(
-                    patch.object(allocator, "_residency_by_buf", side_effect=residency)
-                )
-                stack.enter_context(
-                    patch.object(
-                        allocator, "_cd_parent_relayouts", side_effect=lambda *a: {}
-                    )
-                )
-                stack.enter_context(patch.object(allocator, "_set_one_allocation"))
-                editor_cls = stack.enter_context(
-                    patch.object(allocator_module, "GraphEditor")
-                )
-
-                plans = allocator_module.validated_drain_plans(
-                    graph, division_is_fixed=False
-                )
-                self.assertEqual(set(plans), {"plain"})
-                self.assertIs(plans["plain"].anchor_op, reader_op)
-                allocator._validated_drain_plans = plans
-                built = allocator._build_cd_bound_buffers(
-                    graph, {}, allocator_module._DivisionMap(divisions, set())
-                )
-                solver = allocator.layout_planning(built, allocator.size)
-                solved = {b.name: b for b in solver.plan_layout()}
-                # _commit_divisions would record the committed ownership here.
-                for op in ops:
-                    op.iteration_space_ownership = object()
-                allocator._push_allocation(graph, list(solved.values()), [])
-            return plans["plain"], {b.name: b for b in built}, solved, editor_cls
+            plans, built, solved, editor_cls = self._plan_solve_push(
+                graph, divisions, mem_usage, residency
+            )
+            self.assertEqual(set(plans), {"plain"})
+            self.assertIs(plans["plain"].anchor_op, self.consumer_op)
+            self.assertIsNone(plans["plain"].collective)
+            return plans["plain"], built, solved, editor_cls
 
         with self.subTest("reader splits like the storage"):
             plan, built, solved, editor_cls = run(self.consumer_divs[:2])
@@ -2634,6 +2660,97 @@ class TestResidencyEdgeMatching(unittest.TestCase):
             editor.change_graph_output.assert_not_called()
             # Why: the reader's edge on the storage exists but admits no pair.
             self.assertEqual(built["consumer"].cd_parent_matches.get("plain"), [])
+
+    def test_post_loop_all_reduce_reads_a_drain_of_the_resident_carry(self):
+        """A carry whose only post-loop use is an all_reduce stays in LX.
+
+        The all_reduce's whole-buffer read has no residency edge, so as a
+        parent of the all_reduce the carry admits no division pair, which
+        forces it -- and every in-loop update -- into HBM.  The plan gives the
+        all_reduce a post-loop drain to read instead: the carry is no longer
+        its parent, the carry is resident, the push repoints the all_reduce at
+        the drain, and the carry's lifetime still ends at the all_reduce
+        rather than the graph exit (``tail`` runs after it).
+        """
+        try:
+            from ortools.sat.python import cp_model  # noqa: F401
+        except ImportError:
+            self.skipTest("the joint path needs the CP-SAT solver (ortools)")
+        from torch._inductor.ir import StorageBox, TensorBox
+
+        from torch_spyre._inductor.ir import AllReduceAsyncFallback
+
+        storage_op = self.op_by_name["plain"]
+        all_reduce = MagicMock(spec=AllReduceAsyncFallback)
+        all_reduce.get_name.return_value = "all_reduce"
+        all_reduce.inputs = [TensorBox(StorageBox(storage_op))]
+        tail_op = self._op("tail")
+        graph, ops = self._drained_carry_graph([all_reduce, tail_op], [tail_op])
+        # An extern kernel reads and writes whole buffers.
+        self.rw[all_reduce] = SimpleNamespace(
+            reads=OrderedSet([StarDep("plain")]),
+            writes=OrderedSet([StarDep("all_reduce")]),
+        )
+        self.rw[tail_op] = self._rw(["all_reduce"], ["tail"])
+        mem_usage = {
+            "plain": {"size": 256, "op_inputs": []},
+            "update": {"size": -1, "op_inputs": ["plain"]},
+            "consumer": {"size": 256, "op_inputs": ["update"]},
+            # An extern kernel's FixedLayout output is unsized.
+            "all_reduce": {"size": -1, "op_inputs": ["plain"]},
+            "tail": {"size": 256, "op_inputs": ["all_reduce"]},
+        }
+        residency = {
+            "plain": None,
+            "update": "op not allowed",
+            "consumer": None,
+            "all_reduce": "op not allowed",
+            "tail": None,
+        }
+        divisions = {
+            "plain": self.parent_divs,
+            "update": self.parent_divs,
+            "consumer": self.consumer_divs[:2],
+            "all_reduce": [CoreDivision(splits={})],
+            "tail": self.parent_divs[:1],
+        }
+
+        def run(with_plan):
+            real_plans = allocator_module.validated_drain_plans
+            plans_fn = real_plans if with_plan else (lambda *a, **k: {})
+            with patch.object(allocator_module, "validated_drain_plans", plans_fn):
+                return self._plan_solve_push(graph, divisions, mem_usage, residency)
+
+        with self.subTest("the collective is drained"):
+            plans, built, solved, editor_cls = run(with_plan=True)
+            self.assertEqual(set(plans), {"plain"})
+            plan = plans["plain"]
+            self.assertIs(plan.collective, all_reduce)
+            self.assertIsNotNone(solved["plain"].address)
+            self.assertNotIn("plain", built["all_reduce"].parents)
+            # Live to the all_reduce (index 3), not to the graph exit (5).
+            self.assertEqual(built["plain"].end_time, ops.index(all_reduce) + 1)
+            editor = editor_cls.return_value
+            editor.push_allocation_with_clone.assert_called_once_with(
+                storage_op,
+                [],
+                input=False,
+                private=True,
+                after_fx=plan.loop_origin,
+                lower_anchor=plan.anchor_op,
+            )
+            drain = editor.push_allocation_with_clone.return_value
+            editor.replace_collective_operand.assert_called_once_with(
+                all_reduce, "plain", drain
+            )
+            editor.change_graph_output.assert_not_called()
+
+        with self.subTest("without a plan the all_reduce edge keeps it in HBM"):
+            _plans, built, solved, editor_cls = run(with_plan=False)
+            self.assertIsNone(solved["plain"].address)
+            self.assertIn("plain", built["all_reduce"].parents)
+            self.assertNotIn("plain", built["all_reduce"].cd_parent_matches)
+            editor_cls.return_value.replace_collective_operand.assert_not_called()
 
     @staticmethod
     def _compatible(edge, parent_div, consumer_div):
