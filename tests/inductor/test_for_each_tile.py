@@ -102,9 +102,9 @@ inductor names a fused kernel after every op it fused (`cpp_fused_add_copy_...`)
 the while_loop prologue clones every carried operand under `if not should_loop:`, so
 grepping the wrapper text counts copies that either do not exist or are not ours.
 
-Every tensor stays on CPU and the compiled backend is stock inductor: what is under test
-is the graph `for_each_tile` traces to, which is device-independent, so no Spyre device
-and no Spyre backend compiler is required.
+Every tensor stays on CPU. Lowering checks use stock inductor; graph-reuse checks capture
+and execute the traced graph directly. What is under test is the device-independent graph
+`for_each_tile` traces to, so no Spyre device or Spyre backend compiler is required.
 
 Run:
 
@@ -123,7 +123,7 @@ from typing import NamedTuple
 from unittest import mock
 
 import torch
-from torch._inductor.utils import fresh_cache, run_and_get_code
+from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._inductor.wsr import Gather, for_each_tile
 from torch_spyre._monkey_patch import _patch_scan_input_aliasing
@@ -143,6 +143,7 @@ def post_grad_graphs():
     `post_grad_custom_post_pass` fires BEFORE that decomposition, so a custom pass
     cannot see the while_loop; wrapping the decomposition itself can.
     """
+    import torch._inductor.config as inductor_config
     import torch._inductor.fx_passes.post_grad as pg
 
     seen: list[torch.fx.GraphModule] = []
@@ -155,7 +156,9 @@ def post_grad_graphs():
 
     pg.decompose_scan_to_while_loop = wrapper
     try:
-        yield seen
+        # A cache hit skips the post-grad passes, so nothing would be captured.
+        with inductor_config.patch(force_disable_caches=True):
+            yield seen
     finally:
         pg.decompose_scan_to_while_loop = original
 
@@ -574,18 +577,11 @@ class TestForEachTileLowering(unittest.TestCase):
         """
         torch._dynamo.reset()
         eager = fn(*args)
-        with fresh_cache(), post_grad_graphs() as graphs:
+        with post_grad_graphs() as graphs:
             compiled = torch.compile(fn, backend="inductor", fullgraph=True)
             out, code = run_and_get_code(compiled, *args)
 
-        # `fresh_cache()` because what is under test is the pass, and a warm cache skips
-        # it: a hit serves the compiled artifact and `decompose_scan_to_while_loop` never
-        # runs, so nothing is captured. Inductor does bypass its cache for some graphs
-        # holding a HOP, but not for the inference-mode ones the `output=` cases trace,
-        # and a suite whose assertions depend on which is which is a suite that passes
-        # once. Asserted as well as arranged, so a regression says so here rather than as
-        # an IndexError on `graphs[-1]`.
-        self.assertTrue(graphs, "no post-grad graph captured (cache hit?)")
+        self.assertTrue(graphs, "no post-grad graph captured (FX graph cache hit?)")
 
         # The decomposition runs bottom-up, one module at a time, so the graph captured
         # last is the top-level one and the rest are the subgraphs it now contains.
@@ -702,6 +698,128 @@ class TestForEachTileLowering(unittest.TestCase):
         self._assert_lowers(
             fn, args, ref, name="Bw_split_n_output", loops=1, materializations=1
         )
+
+    def test_pytree_map_outputs_reuse_graph(self):
+        for axis in (0, -1):
+            with self.subTest(axis=axis):
+                graphs = []
+
+                def capture(gm, _):
+                    graphs.append(gm)
+                    return gm.forward
+
+                def kernel(x):
+                    def body(_, tiles):
+                        (tile,) = tiles
+                        return None, (
+                            tile + 1,
+                            {"sums": tile.sum(dim=1 if axis == 0 else 0)},
+                        )
+
+                    return for_each_tile(
+                        body, (x,), dims=(axis,), tile_size=32, out_dim=axis
+                    )[1]
+
+                torch._dynamo.reset()
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                ):
+                    compiled = torch.compile(
+                        kernel, backend=capture, fullgraph=True, dynamic=False
+                    )
+                    for step in range(2):
+                        x = (
+                            torch.arange(96 * 64, dtype=torch.float32).reshape(96, 64)
+                            + step
+                        )
+                        shifted, stats = compiled(x)
+                        torch.testing.assert_close(shifted, x + 1)
+                        torch.testing.assert_close(
+                            stats["sums"], x.sum(dim=1 if axis == 0 else 0)
+                        )
+                self.assertEqual(len(graphs), 1)
+
+    def test_pytree_outputs_with_carry(self):
+        """A carry and nested outputs retain traversal and per-leaf axis semantics."""
+        for axis, reverse in itertools.product((0, 1, -1), (False, True)):
+            with self.subTest(axis=axis, reverse=reverse):
+
+                def kernel(x, init):
+                    def body(carry, tiles):
+                        (tile,) = tiles
+                        return carry + tile.sum(), {
+                            "values": [tile + carry, (tile.unsqueeze(0) - carry,)]
+                        }
+
+                    return for_each_tile(
+                        body,
+                        (x,),
+                        dims=0,
+                        tile_size=2,
+                        init=init,
+                        out_dim=axis,
+                        reverse=reverse,
+                    )
+
+                x = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+                init = torch.tensor(7.0)
+                blocks = x.reshape(3, 2, 4)
+                totals = blocks.sum(dim=(1, 2))
+                inclusive = (
+                    totals.flip(0).cumsum(0).flip(0) if reverse else totals.cumsum(0)
+                )
+                offsets = (init + inclusive - totals).reshape(3, 1, 1)
+                expected = {
+                    "values": [
+                        torch.cat((blocks + offsets).unbind(0), dim=axis),
+                        (
+                            torch.cat(
+                                (blocks - offsets).unsqueeze(1).unbind(0), dim=axis
+                            ),
+                        ),
+                    ]
+                }
+                torch._dynamo.reset()
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                ):
+                    for fn in (
+                        kernel,
+                        torch.compile(kernel, backend="inductor", fullgraph=True),
+                    ):
+                        final, out = fn(x, init)
+                        torch.testing.assert_close(final, init + x.sum())
+                        torch.testing.assert_close(out, expected)
+                torch.testing.assert_close(init, torch.tensor(7.0))
+
+    def test_pytree_output_dim_error_identifies_leaf(self):
+        for axis, scalar in ((1, False), (-2, False), (0, True)):
+            with self.subTest(axis=axis, scalar=scalar):
+
+                def body(_, tiles):
+                    (tile,) = tiles
+                    stats = tile.sum() if scalar else tile.sum(dim=0)
+                    return None, (tile + 1, {"stats": [stats]})
+
+                rank = 0 if scalar else 1
+                with (
+                    mock.patch("torch.accelerator.is_available", return_value=False),
+                    torch.inference_mode(),
+                    self.assertRaisesRegex(
+                        IndexError,
+                        rf"out_dim={axis} is invalid for output\[1\]\['stats'\]\[0\]"
+                        rf" with tile rank {rank}",
+                    ),
+                ):
+                    for_each_tile(
+                        body,
+                        (torch.ones(6, 4),),
+                        dims=0,
+                        tile_size=2,
+                        out_dim=axis,
+                    )
 
     def test_split_k(self):
         """C: co-indexed `dims=(-1, 0)` on the shared axis, carry accumulates.

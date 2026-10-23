@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
+from torch.utils._pytree import keystr, tree_map_with_path
 
 __all__ = ["Gather", "for_each_tile"]
 
@@ -446,7 +447,8 @@ def for_each_tile(
             disabled. Omitting it makes the loop allocate a stacked buffer and fold it,
             which costs a full-size copy of the result for ``out_dim != 0``.
         out_dim: ``int d`` lays step ``i``'s tile at ``narrow(d, i*extent, extent)``
-            of the output, ``extent = output.shape[d] // num_tiles``.
+            of the output, ``extent = output.shape[d] // num_tiles``. Without
+            ``output`` the tile may be a pytree of tensors, each leaf laid out alike.
             ``Gather(axis, index)`` scatters it instead, at
             ``output.index_copy_(axis, index[i], tile)``, and needs ``output``.
             ``None`` means the body emits no tile.
@@ -538,11 +540,16 @@ def for_each_tile(
         # is a view of `output` or empty. Hand back what the caller owns.
         return (None if map_mode else final_carry), output
 
-    if isinstance(ys, (list, tuple)):
-        raise ValueError(
-            "for_each_tile() out_dim= currently supports a single output tile, "
-            f"got a pytree of {len(ys)}"
-        )
+    def stack_output(path, y):
+        rank = y.ndim - 1  # scan adds the leading step axis.
+        try:
+            dim = utils.canonicalize_dim(rank, out_dim, wrap_scalar=False)
+        except IndexError as exc:
+            raise IndexError(
+                f"for_each_tile() out_dim={out_dim} is invalid for output"
+                f"{keystr(path)} with tile rank {rank}: {exc}"
+            ) from exc
+        return _stacked_to_full(y, dim)
 
-    axis = utils.canonicalize_dim(ys.ndim - 1, out_dim)
-    return (None if map_mode else final_carry), _stacked_to_full(ys, axis)
+    out = tree_map_with_path(stack_output, ys)
+    return (None if map_mode else final_carry), out
