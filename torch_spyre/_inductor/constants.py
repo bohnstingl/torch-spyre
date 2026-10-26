@@ -158,6 +158,8 @@ SPYRE_FP32_OPS = [
     "rsqrt",
     "topkvalue",
     "topkindex",
+    # topk.ddl binds keepbyindex for IEEE_FP32 as well as SEN169_FP16.
+    "keepbyindex",
     "floor",
     "to_dtype",
     "maximum",
