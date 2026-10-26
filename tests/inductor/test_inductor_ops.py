@@ -4850,6 +4850,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ).clamp(-9.5, -2.0),
                     1.0,
                 ),
+                # The clamp applies before the scaling, so beta * x stays in
+                # [-9.5, -2] and the result above the fp16 normal minimum. Widened
+                # further, the expected values underflow and all zeros would pass.
                 "2d_negative_beta_0p5": (
                     (
                         cached_randn((256, 128), dtype=torch.float16, scale=4.0) - 12.0

@@ -1840,11 +1840,13 @@ def spyre_gelu(
     return torch.ops.spyre.gelu(input, approximate)
 
 
-# Empirical cutoff point, below which the runtime softplus primitive loses accuracy.
+# Below this input the log1p series replaces the runtime primitive, which is up to
+# 1.4% off in [-2, -1) and returns 0 below -7 (#5741). The series' truncation error
+# peaks here at 3.1e-4, but the primitive just above is up to 0.6% off, so the
+# output can step by that much at the cutoff.
 _SOFTPLUS_SERIES_CUTOFF = -1.0
-# Number of expansion terms to approximate
-# log1p(u) = u - u^2/2 + u^3/3 - ...
-# At u = e^-1 the next term is below fp16 resolution.
+# Terms of log1p(u) = u - u^2/2 + u^3/3 - ...; at u = e^-1 the next one is below
+# fp16 resolution.
 _SOFTPLUS_SERIES_TERMS = 6
 
 
@@ -1852,14 +1854,16 @@ def _softplus_unit_beta(input: torch.Tensor, threshold: float) -> torch.Tensor:
     """``softplus(x, beta=1)``: the primitive above the cutoff, log1p(e^x) below.
 
     There is no log1p on Spyre and log(1 + e^x) rounds to 0 just like the
-    primitive, so the small-x branch is the log1p series in Horner form.
+    primitive, so the small-x branch is the log1p series in Horner form. PyTorch
+    returns x only for x > threshold, so a threshold below the cutoff lowers it.
     """
-    u = torch.exp(torch.clamp_max(input, _SOFTPLUS_SERIES_CUTOFF))
+    cutoff = min(_SOFTPLUS_SERIES_CUTOFF, threshold)
+    u = torch.exp(torch.clamp_max(input, cutoff))
     acc = torch.full_like(u, 1.0 / _SOFTPLUS_SERIES_TERMS)
     for k in range(_SOFTPLUS_SERIES_TERMS - 1, 0, -1):
         acc = 1.0 / k - u * acc
     return torch.where(
-        input < _SOFTPLUS_SERIES_CUTOFF,
+        input < cutoff,
         u * acc,
         torch.ops.spyre.softplus(input, 1.0, threshold),
     )
