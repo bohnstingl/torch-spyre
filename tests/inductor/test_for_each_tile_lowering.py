@@ -5427,9 +5427,14 @@ class TestRecoverSpyreHints(unittest.TestCase):
         must not take that later scope's hint, nor shift the nodes after it
         onto it.
 
-        Mirrors gpt-oss: mm_to_bmm_pass inserts unsqueeze/expand into RoPE, the
-        in-graph MoE's hinted scope further down holds the same targets, and the
-        attention reshape in between took the MoE's work_div={"T": 32}.
+        A reduced gpt-oss block graph: mm_to_bmm_pass inserts unsqueeze/expand
+        into RoPE after the snapshot, and the in-graph MoE's hinted scope further
+        down holds the same targets. On the target-only scan the inserted pair
+        consumes the scope's unsqueeze/expand entries, so the unhinted KV-store
+        reshape in between (kv_view) matches the scope's reshape and takes its
+        work_div={"T": 32}, the "size=8 is not evenly divisible by split=32"
+        failure, while the scope's own unsqueeze/expand lose theirs. Asserting
+        the exact hinted names covers both.
         """
         import torch_spyre  # noqa: F401  registers the spyre ops
         from torch_spyre._inductor.propagate_hints import (

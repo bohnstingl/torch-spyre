@@ -261,8 +261,17 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     shared producer as two identical nodes -> ``add(mm, mm_default)``). A node
     created after this snapshot gets a fresh name (mm_default), so its name says
     nothing, but its ``target`` OpOverload does. A node that survives until
-    recovery keeps its name, which FX never reissues within a graph, so recovery
-    anchors on it.
+    recovery keeps its name, so recovery anchors on it.
+
+    Names identify nodes only within this ``Graph`` object, where FX never
+    reissues one, even after its node is erased. The passes up to
+    recover_spyre_hints edit this graph in place (decompose_auto_functionalized
+    splices its make_fx trace in through replace_by_example, so those nodes get
+    fresh names here). A pass that replaced ``gm.graph`` with a retrace would
+    restart the name counters. Where no name matches, recovery falls back to
+    the unbounded target scan, but a retraced node that happens to share a
+    snapshotted node's name and target anchors on that entry and can take a
+    hint the target scan would not have given it.
 
     Also snapshots every scan-combine-fn subgraph in encounter order (see
     ``_scan_combine_subgraphs``): for_each_tile's body traces into its own
@@ -379,6 +388,13 @@ def _apply_snapshot_flat(
     recurs later in the snapshot (mm_to_bmm's unsqueeze/expand) would jump the
     cursor past every entry in between and take the hint of an unrelated,
     distant scope.
+
+    The bound includes the anchor's own entry, so a same-target node inserted
+    directly before a surviving hinted node still takes that node's hint. This
+    is deliberate: it is how a copy of a hinted node placed just before the
+    original keeps the hint, and target alone cannot tell the two apart. Anchors
+    stop a hint from travelling past a surviving node; they do not make an
+    insertion next to one safe.
     """
     position = {name: i for i, (_, _, name) in enumerate(snapshot) if name}
 
@@ -556,6 +572,13 @@ def _recover_collected_hints(gm: torch.fx.GraphModule) -> bool:
     subgraph_snapshots = gm.meta.pop("__spyre_dim_hints_subgraphs", [])
     nodes = [n for n in gm.graph.nodes if n.op == "call_function"]
     matched, hinted = _apply_snapshot(nodes, _dim_hints)
+    target_of = {n.name: n.target for n in nodes}
+    if hinted and not any(target_of.get(name) == t for t, _, name in _dim_hints):
+        logger.debug(
+            "_recover_collected_hints: on %s, no snapshot entry kept its node "
+            "name and target; hints were aligned on target alone, unbounded.",
+            gm._get_name(),
+        )
     if matched < hinted:
         logger.debug(
             "_recover_collected_hints: on %s, matched %d/%d hinted snapshot "
