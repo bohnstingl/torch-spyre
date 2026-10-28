@@ -467,6 +467,22 @@ def _qfp8ch_stl(stl: SpyreTensorLayout, out_dtype: torch.dtype) -> SpyreTensorLa
     )
 
 
+def qfp8wt_dim_order(rank: int) -> list[int]:
+    """Default host dim order for a QFP8WT tensor [..., K, N]: [K, L0, .., N].
+
+    The 2D stick pairs K with N, but the device layout records only a 1D stick
+    of N, so readers (codegen, work division) take K from device coordinate -2.
+    This default places host dim -2 there, giving the device order
+    [L0, .., N-tile, K, stick]; it assumes the tensor is [..., K, N]. When a
+    matmul reads the tensor, nonstick_dim_order takes K from the matmul's
+    reduction variable instead and reorders this layout if they disagree.
+    Rank 2 stays [0, 1].
+    """
+    if rank < 2:
+        return list(range(rank))
+    return [rank - 2, *range(rank - 2), rank - 1]
+
+
 def _qfp8wt_stl(
     output: FixedLayout,
     in_layout: FixedLayout,
@@ -479,7 +495,8 @@ def _qfp8wt_stl(
     Outer dimensions and strides are preserved from output layout, with the innermost
     stride always set to 1. For unaligned inputs where input stick size is not a
     multiple of input stick size, the last dimension is padded to the stick size.  For
-    aligned inputs, it retains the concrete output size.
+    aligned inputs, it retains the concrete output size. The device order puts K
+    directly outside the stick (see ``qfp8wt_dim_order``).
 
     Args:
         output: Inductor ``FixedLayout`` for the op's output tensor.
@@ -497,7 +514,7 @@ def _qfp8wt_stl(
         c_size,
         c_stride,
         output.dtype,
-        list(range(len(c_size))),
+        qfp8wt_dim_order(len(c_size)),
         ElementArrangement.QFP8WT,
     )
 
@@ -689,7 +706,10 @@ def _single_arg_op_layout(
             # stick dim is unaligned, force a full input-stick depth so stick
             # padding is reflected in the device layout (see #1756 example above).
             in_elems_per_stick = get_elem_in_stick(in_layout.dtype)
-            if concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0:
+            if (
+                in_layout.size
+                and concretize_expr(in_layout.size[-1] % in_elems_per_stick) > 0
+            ):
                 c_size = [concretize_expr(s) for s in output.size[:-1]] + [
                     in_elems_per_stick
                 ]
@@ -2864,31 +2884,108 @@ def propagate_spyre_tensor_layouts(
     operations = graph.operations
     # Convert InputBuffers from FixedLayout to SpyreTensorLayouts
     if len(graph.graph_input_names) > 0:
-        for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
-            if isinstance(real_input, torch.Tensor):
-                stl = real_input.device_tensor_layout()
-                if stl is None:
-                    # A CPU tensor lifted as a graph input, or a host tensor
-                    # feeding a FallbackKernel has no Spyre layout;
-                    # leave its FixedLayout and .layouts untouched,
-                    # mirroring the non-Spyre ComputedBuffer skip below.
-                    continue
-                tb = graph.graph_inputs[name]
-                if (
-                    not isinstance(tb, TensorBox)
-                    or not isinstance(tb.data, StorageBox)
-                    or not isinstance(tb.data.data, InputBuffer)
-                ):
-                    raise Unsupported(
-                        f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+        if getattr(graph, "parent", None) is not None:
+            # SubgraphLowering: resolve input layouts from parent operands rather than V.get_real_inputs()
+            parent_operands = None
+            for op in graph.parent.operations:
+                if hasattr(op, "get_subgraphs"):
+                    subgraphs = op.get_subgraphs()
+                    if any(getattr(sg, "graph", None) is graph for sg in subgraphs):
+                        if getattr(op, "operands", None) is not None:
+                            parent_operands = op.operands
+                        elif hasattr(op, "inputs"):
+                            parent_operands = op.inputs
+                        elif hasattr(op, "carried_inputs") and hasattr(
+                            op, "additional_inputs"
+                        ):
+                            parent_operands = [
+                                *op.carried_inputs,
+                                *op.additional_inputs,
+                            ]
+                        break
+            if parent_operands is not None:
+                for name, operand in zip(graph.graph_input_names, parent_operands):
+                    tb = graph.graph_inputs[name]
+                    stl = None
+                    if hasattr(operand, "layouts") and operand.layouts:
+                        stl = operand.layouts[0]
+                    elif hasattr(operand, "get_layout"):
+                        lay = operand.get_layout()
+                        if hasattr(lay, "device_layout"):
+                            stl = lay.device_layout
+                    if (
+                        stl is None
+                        and hasattr(operand, "data")
+                        and hasattr(operand.data, "data")
+                    ):
+                        inner = operand.data.data
+                        if hasattr(inner, "layout") and hasattr(
+                            inner.layout, "device_layout"
+                        ):
+                            stl = inner.layout.device_layout
+                    if stl is None and hasattr(operand, "get_name"):
+                        # A parent pass may replace a buffer after the HOP
+                        # captured it; resolve by name to the current one.
+                        cur = next(
+                            (
+                                o
+                                for o in graph.parent.operations
+                                if o.get_name() == operand.get_name()
+                            ),
+                            None,
+                        )
+                        if cur is not None and hasattr(
+                            getattr(cur, "layout", None), "device_layout"
+                        ):
+                            stl = cur.layout.device_layout
+                    if stl is None:
+                        ptl = tb.data.data.layout
+                        stl = SpyreTensorLayout(
+                            [concretize_expr(s) for s in ptl.size],
+                            [concretize_expr(s) for s in ptl.stride],
+                            ptl.dtype,
+                            list(range(len(ptl.size))),
+                        )
+                    tb.layouts = [stl]
+            else:
+                for name in graph.graph_input_names:
+                    tb = graph.graph_inputs[name]
+                    ptl = tb.data.data.layout
+                    stl = SpyreTensorLayout(
+                        [concretize_expr(s) for s in ptl.size],
+                        [concretize_expr(s) for s in ptl.stride],
+                        ptl.dtype,
+                        list(range(len(ptl.size))),
                     )
-                ptl = tb.data.data.layout
-                if not isinstance(ptl, FixedLayout):
-                    raise Unsupported(f"graph input {name} does not have a FixedLayout")
-                new_layout = _eager_view_input_layout(real_input, ptl, name)
-                if new_layout is not None:
-                    tb.data.data.layout = new_layout
-                tb.layouts = [stl]
+                    tb.layouts = [stl]
+        else:
+            for name, real_input in zip(graph.graph_input_names, V.get_real_inputs()):
+                if isinstance(real_input, torch.Tensor):
+                    stl = real_input.device_tensor_layout()
+                    if stl is None:
+                        # A CPU tensor lifted as a graph input, or a host tensor
+                        # feeding a FallbackKernel has no Spyre layout;
+                        # leave its FixedLayout and .layouts untouched,
+                        # mirroring the non-Spyre ComputedBuffer skip below.
+                        continue
+                    tb = graph.graph_inputs[name]
+                    if (
+                        not isinstance(tb, TensorBox)
+                        or not isinstance(tb.data, StorageBox)
+                        or not isinstance(tb.data.data, InputBuffer)
+                    ):
+                        raise Unsupported(
+                            f"graph input {name} is not a TensorBox(StorageBox(InputBuffer))"
+                        )
+                    ptl = tb.data.data.layout
+                    if not isinstance(ptl, FixedLayout):
+                        raise Unsupported(
+                            f"graph input {name} does not have a FixedLayout"
+                        )
+                    new_layout = _eager_view_input_layout(real_input, ptl, name)
+                    if new_layout is not None:
+                        tb.data.data.layout = new_layout
+                    tb.layouts = [stl]
 
     mutation_alts, mutation_consumer_counts, mutation_writers = (
         _scan_mutation_layout_inputs(operations)
