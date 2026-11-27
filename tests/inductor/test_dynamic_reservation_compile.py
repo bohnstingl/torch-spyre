@@ -265,3 +265,105 @@ def test_a_loop_over_a_dim_declared_with_an_explicit_layout_is_right_at_every_si
 
     assert counters["stats"]["unique_graphs"] == 1
     assert _kernel_cache_entries() == 1
+
+
+# A range that admits 1, walked one row per trip like a page or chunk count.
+ONE_SPEC = {"min": 1, "max": 16, "granularity": 1}
+# The compile size first, then 1 on both sides of a size above it.
+ONE_SIZES = [16, 1, 3, 1, 16]
+
+
+def summed_rows(a, b=None):
+    """The rows of ``a`` (plus ``b``'s) summed one row per trip into the carry."""
+    rows = a.shape[0]
+    torch._check(rows >= ONE_SPEC["min"])
+    torch._check(rows <= ONE_SPEC["max"])
+    inputs = (a,)
+    if b is not None:
+        # Unbacked sizes are never unified, so a second declared input is tied.
+        torch._check(b.shape[0] == rows)
+        inputs = (a, b)
+
+    def body(carry, tiles):
+        for tile in tiles:
+            carry = carry + tile
+        return carry, None
+
+    init = torch.zeros((1, COLS), dtype=a.dtype, device=a.device)
+    carry, _ = for_each_tile(
+        body, inputs, dims=(0,) * len(inputs), tile_size=1, init=init
+    )
+    return carry
+
+
+@pytest.mark.parametrize("unbacked", [True, False], ids=["unbacked", "backed"])
+def test_a_range_from_one_serves_size_one_without_a_recompile(unbacked):
+    """Dynamo specializes a backed size of 1, so a graph traced at 16 rows guards
+    ``2 <= rows`` and recompiles at 1. A range that admits 1 is marked unbacked
+    instead, and one graph and one kernel serve every size. The backed mark is the
+    control that shows the test can fail.
+
+    fp16 sums of up to 16 values in [0, 1) against an fp32 reference.
+    """
+    x = torch.rand(ONE_SPEC["max"], COLS, dtype=torch.float16)
+    with spyre_config.patch(min_reserved_dim_size=1, unbacked_declared_dims=unbacked):
+        y = x.to(DEVICE, dynamic={0: ONE_SPEC})
+    compiled = torch.compile(summed_rows, fullgraph=True)
+
+    for n in ONE_SIZES:
+        if y.size(0) != n:
+            y.resize_((n, COLS))
+        out = compiled(y).cpu().float()
+        torch.testing.assert_close(
+            out,
+            x[:n].float().sum(dim=0, keepdim=True),
+            atol=ATOL,
+            rtol=RTOL,
+            msg=f"at {n} rows",
+        )
+
+    graphs = 1 if unbacked else 2
+    assert counters["stats"]["unique_graphs"] == graphs
+    assert _kernel_cache_entries() == graphs
+
+
+def test_two_inputs_declared_from_one_share_one_graph_at_size_one():
+    """Two inputs declared over the same range, walked together in one loop and
+    tied by a ``torch._check``, as a page table and its mask stack are."""
+    x = torch.rand(ONE_SPEC["max"], COLS, dtype=torch.float16)
+    w = torch.rand(ONE_SPEC["max"], COLS, dtype=torch.float16)
+    with spyre_config.patch(min_reserved_dim_size=1):
+        y = x.to(DEVICE, dynamic={0: ONE_SPEC})
+        v = w.to(DEVICE, dynamic={0: ONE_SPEC})
+    compiled = torch.compile(summed_rows, fullgraph=True)
+
+    for n in ONE_SIZES:
+        if y.size(0) != n:
+            y.resize_((n, COLS))
+            v.resize_((n, COLS))
+        out = compiled(y, v).cpu().float()
+        expected = (x[:n].float() + w[:n].float()).sum(dim=0, keepdim=True)
+        torch.testing.assert_close(
+            out, expected, atol=ATOL, rtol=RTOL, msg=f"at {n} rows"
+        )
+
+    assert counters["stats"]["unique_graphs"] == 1
+
+
+@pytest.mark.parametrize(
+    "spec, unbacked",
+    [(ONE_SPEC, True), ({"min": 2, "max": 16, "granularity": 2}, False), (SPEC, False)],
+    ids=["min1", "min2", "min140"],
+)
+def test_only_a_range_that_admits_one_is_marked_unbacked(spec, unbacked):
+    """A range from 2 up keeps the backed mark it had, so its compile is unchanged.
+    The unbacked mark plans at the declared maximum."""
+    with spyre_config.patch(min_reserved_dim_size=1):
+        y = torch.rand(spec["max"], COLS, dtype=torch.float16).to(
+            DEVICE, dynamic={0: spec}
+        )
+
+    assert (0 in getattr(y, "_dynamo_unbacked_indices", ())) == unbacked
+    assert (0 in getattr(y, "_dynamo_dynamic_indices", ())) == (not unbacked)
+    if unbacked:
+        assert y._dynamo_hint_overrides == {0: spec["max"]}

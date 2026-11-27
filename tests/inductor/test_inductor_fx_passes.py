@@ -347,6 +347,26 @@ class TestPassUtils(unittest.TestCase):
         assert granularity == 32
         assert any("came from optimization_hint" in str(x.message) for x in w)
 
+    def test_a_declared_unbacked_size_is_not_a_loop_variable(self):
+        """A declared range that admits 1 is unbacked. In an index it is a size, so
+        it is concretized, and only the loop variable stays symbolic."""
+        from torch_spyre._inductor.pass_utils import (
+            concretize_index,
+            declared_dims,
+            loop_induction_symbols,
+        )
+
+        size, loop_var = sympy.symbols("u0 u1", integer=True, positive=True)
+        index = 128 * size * loop_var + loop_var
+        mock_v = self._mock_v(optimization_hint=16)
+        with (
+            declared_dims({"u0": (1, 16, 1)}),
+            patch("torch_spyre._inductor.pass_utils.V", mock_v),
+        ):
+            assert loop_induction_symbols(index, set()) == [loop_var]
+            assert concretize_index(index, set()) == 2049 * loop_var
+        assert loop_induction_symbols(index, set()) == [size, loop_var]
+
 
 class TestRepointMutationTargets(unittest.TestCase):
     """Unit tests for ``pass_utils._repoint_mutation_targets``.

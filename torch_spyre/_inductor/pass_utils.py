@@ -541,15 +541,15 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
 def trip_count_estimate(count) -> int:
     """A loop's trip count as an ``int`` (at least 1), for pricing re-reads.
 
-    A symbolic count resolves with :func:`concretize_expr`. An unbacked count,
-    or one that does not resolve, is 1.
+    A symbolic count resolves with :func:`concretize_expr`. A count over an
+    undeclared unbacked symbol, or one that does not resolve, is 1.
     """
     try:
         return max(1, int(count))
     except (TypeError, ValueError):
         pass
     try:
-        if free_unbacked_symbols(count):
+        if undeclared_unbacked_symbols(count):
             return 1
         return max(1, int(concretize_expr(count)))
     except Exception as e:  # noqa: BLE001 - an estimate: fall back to one trip
@@ -599,6 +599,17 @@ def declared_dims_in(expr) -> dict[str, tuple[int, int, int]]:
 def declared_dim_of(symbol) -> "tuple[int, int, int] | None":
     """The ``(min, max, granularity)`` declared for one symbol, or None."""
     return _DECLARED_DIMS.get().get(str(symbol))
+
+
+def undeclared_unbacked_symbols(expr) -> OrderedSet[sympy.Symbol]:
+    """``expr``'s unbacked symbols that are not declared dimensions.
+
+    These are loop variables and data-dependent values. A declared dimension whose
+    range admits 1 is unbacked too (``_monkey_patch._reserve_and_copy``), but it is
+    a size, resolved at its declared maximum like a backed one.
+    """
+    declared = _DECLARED_DIMS.get()
+    return OrderedSet(s for s in free_unbacked_symbols(expr) if str(s) not in declared)
 
 
 def substitute_declared_max(expr):
@@ -1071,13 +1082,14 @@ def loop_induction_symbols(
     """The loop induction variables an index uses, in name order.
 
     A loop variable is an unbacked symbol (``u0``: ``splice_while_loops`` defines it
-    with a ``DynamicScalar`` op) that is not one of the op's own iteration
-    variables. This is the definition :func:`concretize_index` relies on to keep
-    the variable symbolic, so the two cannot disagree.
+    with a ``DynamicScalar`` op) that is neither one of the op's own iteration
+    variables nor a declared dimension. This is the definition
+    :func:`concretize_index` relies on to keep the variable symbolic, so the two
+    cannot disagree.
     """
     if not isinstance(index, sympy.Basic):
         return []
-    unbacked = free_unbacked_symbols(index)
+    unbacked = undeclared_unbacked_symbols(index)
     return sorted(
         (
             s
@@ -1120,8 +1132,8 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     # the coordinate expression before coarse_tile.py's dim_hints machinery
     # (_loop_var_to_ranges_pos) ever gets a chance to find it. Unlike size
     # symbols (s0, s1, ...), unbacked symbols must stay symbolic here, same as
-    # loop_vars.
-    unbacked_syms = free_unbacked_symbols(index)
+    # loop_vars. A declared dimension is a size even when it is unbacked.
+    unbacked_syms = undeclared_unbacked_symbols(index)
     size_syms = {
         s
         for s in (index.free_symbols - loop_vars)

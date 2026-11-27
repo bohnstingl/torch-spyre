@@ -257,6 +257,11 @@ max_buckets: int = int(os.getenv("MAX_BUCKETS", "256"))
 # below it.
 min_reserved_dim_size: int = int(os.getenv("MIN_RESERVED_DIM_SIZE", "8"))
 
+# A tensor.to("spyre", dynamic=...) range whose min is 1 marks its dim unbacked, so
+# one graph also serves size 1 (a backed size of 1 is specialized). Read when the
+# tensor is transferred. Set SPYRE_UNBACKED_DECLARED_DIMS=0 for the backed mark.
+unbacked_declared_dims: bool = os.getenv("SPYRE_UNBACKED_DECLARED_DIMS", "1") == "1"
+
 # Soft floor on the auto-derived granularity when mark_dynamic(min=...)
 # is not provided. Keeps the picked granularity from collapsing to a
 # very small divisor when max_size has many of them.

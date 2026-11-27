@@ -342,6 +342,20 @@ class TestCoarseTileLoopTripCount(TestCase):
             self.assertEqual(_coarse_tile_loop_trip_count(op), 4)
         concretize.assert_not_called()
 
+    def test_a_declared_unbacked_trip_count_is_priced_at_the_declared_maximum(self):
+        """A declared range that admits 1 is unbacked, but it is a size, not a loop
+        variable: its loop is priced at the declared maximum, as a backed one is."""
+        from torch._inductor.virtualized import V
+        from torch_spyre._inductor.pass_utils import declared_dims
+
+        u = sympy.Symbol("u0", positive=True, integer=True)
+        op = types.SimpleNamespace(loop_member=self._tiled([u // 8, 4]))
+        graph = types.SimpleNamespace(
+            sizevars=types.SimpleNamespace(optimization_hint=lambda _e: 8)
+        )
+        with declared_dims({"u0": (1, 64, 1)}), V.set_graph_handler(graph):
+            self.assertEqual(_coarse_tile_loop_trip_count(op), 32)
+
     def test_symbolic_trip_count_resolves_through_concretize_expr(self):
         """A symbolic count that concretize_expr resolves (the declared maximum
         or the hint) is priced at that value, not as one trip."""

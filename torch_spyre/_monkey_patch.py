@@ -215,10 +215,10 @@ def _reserve_and_copy(
     dst = allocate(src.size(), src.stride(), src.dtype)
     copy_tensor(src, dst, non_blocking=non_blocking)
 
-    # mark_dynamic must run eagerly, before any compile, so Dynamo treats
-    # `dim` as symbolic from the first trace.
+    # The mark must run eagerly, before any compile, so Dynamo treats `dim` as
+    # symbolic from the first trace.
     #
-    # Bare on purpose. min=/max= install a StrictMinMaxConstraint, and the
+    # No min=/max= on purpose. They install a StrictMinMaxConstraint, and the
     # divisibility check for_each_tile records (torch._check(length %
     # tile_size == 0), wsr/for_each_tile.py) then raises
     # ConstraintViolationError, because not every value in the range is a
@@ -227,7 +227,19 @@ def _reserve_and_copy(
     # compile from the graph inputs and builds a for_each_tile loop's geometry
     # at the declared maximum, with the size bound at launch. The range checks
     # inside the trace are still written by the traced function.
-    torch._dynamo.mark_dynamic(dst, spec.dim)
+    #
+    # Dynamo specializes a backed size of 0 or 1, so a graph traced at a
+    # larger size guards `2 <= size` and recompiles at 1. A range that admits 1
+    # is marked unbacked instead, which is never specialized; the hint plans it
+    # at the declared maximum, where the compiler builds its geometry anyway.
+    from torch_spyre._inductor import config as inductor_config
+
+    if spec.min <= 1 and inductor_config.unbacked_declared_dims:
+        from torch._dynamo.decorators import mark_unbacked
+
+        mark_unbacked(dst, spec.dim, hint_override=spec.max)
+    else:
+        torch._dynamo.mark_dynamic(dst, spec.dim)
     return dst
 
 

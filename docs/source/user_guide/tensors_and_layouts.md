@@ -459,6 +459,20 @@ dimension, so `torch.compile` treats it as symbolic from the first trace. The
 `min`/`max` range itself is not passed to Dynamo; it is enforced when the tensor
 is resized.
 
+A range whose `min` is 1 (allowed once `config.min_reserved_dim_size` is
+lowered to 1) is marked with `torch._dynamo.decorators.mark_unbacked` instead,
+with `hint_override=max`. Dynamo specializes a backed size of 0 or 1, so a graph
+traced at a larger size would recompile at size 1. An unbacked size is never
+specialized, so one graph serves size 1 too. Two things change for the traced
+function:
+
+- It cannot branch on the size. `if x.shape[0] > 1:` raises a data-dependent
+  error; bound the size with `torch._check` instead.
+- Two such inputs of the same size do not share one symbol. If the code relies
+  on them being equal, say so: `torch._check(b.shape[0] == a.shape[0])`.
+
+Set `SPYRE_UNBACKED_DECLARED_DIMS=0` to keep the backed mark for these ranges.
+
 #### Resizing
 
 A reserved tensor is resized in place with `resize_`:
@@ -723,7 +737,8 @@ A view or `detach()` result is a new tensor object, so it does not carry the
 Without that mark, the first compile treats the tensor as static, even though
 it keeps its reservation; the next distinct size recompiles with the dimension
 dynamic and picks up the declared range. Call `torch._dynamo.mark_dynamic` on
-it yourself to skip that first compile.
+it yourself to skip that first compile (`mark_unbacked(t, 0, hint_override=max)`
+for a range whose `min` is 1).
 
 To inspect a tensor's reservation, use `get_reserved_dims` (it returns `None`
 when there is no valid reservation):
